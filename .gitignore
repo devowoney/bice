@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Jupyter Notebook 
+.ipynb_checkpoints
+*.nbconvert.ipynb
+
+# User-specific files
+tmp*
+sb_*
+.tmp/*
+!.tmp/runs
+model/*
+
+# AI agent
+CLAUDE.md
+.claude/
+.github/

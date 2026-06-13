@@ -1,0 +1,45 @@
+name: oceanai
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+
+dependencies:
+  - python=3.12
+
+  # Core scientific stack
+  - numpy
+  - scipy
+  - pandas
+  - xarray
+  - netcdf4
+  - h5netcdf
+  - zarr
+  - dask
+  - dask-image
+  - numba
+
+  # cuda
+  - cuda=12.8.1
+  - cuda-toolkit=12.8.1
+  - cuda-nvcc
+  - cudnn
+
+  # Visualization
+  - matplotlib
+  - seaborn
+  - plotly
+  - tensorboard
+
+  # Workflow & reproducibility
+  - pip
+  - pip:
+      - hydra-core
+      - omegaconf
+      - tqdm
+      - einops
+      - lightning
+      - xarray-datatree
+      - torch 
+      - torchvision 
+      - --extra-index-url https://download.pytorch.org/whl/cu126
