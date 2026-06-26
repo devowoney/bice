@@ -38,19 +38,19 @@ from .metrics import MetricsComputer
 class ICOptimizer:
     """
     Initial condition optimizer using gradient descent.
-    
+
     Implements ML-4DVar optimization with frozen pretrained model (glonet v1).
     Follows research decisions:
     - R2: SSH along-track + SST gridded observation operators
     - R4: Per-variable + basin-stratified RMSE metrics
     - R8: TensorBoard hierarchy for experiment tracking
     - CS1: Human-readable, well-commented code
-    
+
     Scientific integrity constraints:
     - A1: Frozen-model invariant (no weight updates)
     - A2: Strict obs/eval separation (observation mode enforcement)
     """
-    
+
     def __init__(
         self,
         forward_model: ForwardModel,
@@ -67,11 +67,11 @@ class ICOptimizer:
         save_frequency: int = 100,
         log_frequency: int = 1,
         histogram_frequency: int = 50,
-        scheduled_pooling: Optional[ScheduledPooling] = None
+        scheduled_pooling: Optional[ScheduledPooling] = None,
     ):
         """
         Initialize IC optimizer.
-        
+
         Args:
             forward_model: Forward model wrapper
             loss_fn: Loss function (observation term)
@@ -104,82 +104,83 @@ class ICOptimizer:
         self.log_frequency = log_frequency
         self.histogram_frequency = histogram_frequency
         self.scheduled_pooling = scheduled_pooling
-        
+
         # Tracking variables
         self.history = []
-        self.best_loss = float('inf')
+        self.best_loss = float("inf")
         self.best_iteration = 0
         self.best_x0 = None
         self.best_predictions = None
-        
+
         # Writer initialized later after exp_id is set
         self.writer = None
-    
+
     def setup_directories(self, exp_id: str):
         """
         Set up experiment-specific output directories.
-        
+
         Creates:
         - .tmp/outputs/{exp_id}/config.yaml
         - .tmp/outputs/{exp_id}/checkpoints/
         - .tmp/outputs/{exp_id}/metrics/
         - .tmp/outputs/{exp_id}/tb/          (TensorBoard)
-        
+
         Args:
             exp_id: Experiment identifier (e.g., "refIC_fullobs_2026-06-22_15-30-45")
         """
         self.exp_id = exp_id
-        
+
         # Create experiment directory structure
-        self.exp_dir = self.output_dir / exp_id
+        # self.exp_dir = self.output_dir / exp_id
+        self.exp_dir = Path(".")
         self.checkpoint_dir = self.exp_dir / self.checkpoints_subdir
         self.metrics_dir = self.exp_dir / self.metrics_subdir
         self.tensorboard_dir = self.exp_dir / self.tensorboard_subdir
-        
+
         # Create all directories
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_dir.mkdir(parents=True, exist_ok=True)
         self.tensorboard_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Initialize TensorBoard writer for this experiment
         self.writer = SummaryWriter(log_dir=str(self.tensorboard_dir))
-        
+
         logger.info(f"Output directory: {self.exp_dir}")
         logger.info(f"TensorBoard logs: {self.tensorboard_dir}")
         logger.info(f"Checkpoints: {self.checkpoint_dir}")
-    
+
     def optimize(
         self,
         x0_init: torch.Tensor,
         target_sequence: torch.Tensor,
         ocean_mask: torch.Tensor,
         exp_id: str,
-        regional_masks: Optional[Dict[str, np.ndarray]] = None
+        regional_masks: Optional[Dict[str, np.ndarray]] = None,
     ) -> Tuple[torch.Tensor, Dict]:
         """
         Run optimization loop.
-        
+
         Args:
             x0_init: Initial condition [B, T=2, C, H, W]
             target_sequence: Target observations [B, T_obs, C, H, W]
             ocean_mask: Ocean mask [C, H, W]
             exp_id: Experiment identifier for output directory
             regional_masks: Regional masks for basin-stratified metrics (optional)
-            
+
         Returns:
             best_x0: Optimized initial condition [B, T=2, C, H, W]
             results: Dictionary with optimization results and history
         """
         # Setup directories for this experiment
         self.setup_directories(exp_id)
-        
+
         # Initialize optimization variables
         x0_current = x0_init.clone().detach().requires_grad_(True)
         x0_reference = x0_init.clone().detach()  # Reference IC (never updated)
-        
+
         # Number of forward steps to roll out
         num_forecast_steps = target_sequence.shape[1]
-        
+
         logger.info(f"\n{'='*60}")
         logger.info("Starting IC Optimization")
         logger.info(f"{'='*60}")
@@ -191,7 +192,7 @@ class ICOptimizer:
         if self.scheduled_pooling is not None:
             logger.info(f"Scheduled pooling: {self.scheduled_pooling.schedule_type}")
         logger.info(f"{'='*60}\n")
-        
+
         # Compute initial predictions (for comparison)
         with torch.no_grad():
             _, y_hat_init_steps = self.forward_model.forward(x0_init, num_forecast_steps)
@@ -199,41 +200,37 @@ class ICOptimizer:
                 y_hat_init_steps, target_sequence, return_details=True
             )
             logger.info(f"Initial loss: {initial_loss.item():.6f}\n")
-        
+
         # Main optimization loop
         for iteration in range(self.num_iterations):
             # Zero gradients
             if x0_current.grad is not None:
                 x0_current.grad.zero_()
-            
+
             # Get current pooling kernel size (for scheduled pooling)
             if self.scheduled_pooling is not None:
                 current_kernel = self.scheduled_pooling.get_kernel_size(iteration)
                 self.gradient_filter.set_kernel_size(current_kernel)
             else:
                 current_kernel = 1  # No pooling
-            
+
             # Forward pass: rollout model for num_forecast_steps
             _, y_hat_steps = self.forward_model.forward(x0_current, num_forecast_steps)
-            
+
             # Compute loss
-            loss, loss_details = self.loss_fn(
-                y_hat_steps, target_sequence, return_details=True
-            )
-            
+            loss, loss_details = self.loss_fn(y_hat_steps, target_sequence, return_details=True)
+
             # Backward pass: compute gradients
-            gradients = torch.autograd.grad(
-                loss, x0_current, create_graph=False
-            )[0]
-            
+            gradients = torch.autograd.grad(loss, x0_current, create_graph=False)[0]
+
             # Apply gradient filtering
             filtered_gradients = self.gradient_filter(
                 gradients,
                 x0_current=x0_current,
                 x0_reference=x0_reference,
-                kernel_size=current_kernel
+                kernel_size=current_kernel,
             )
-            
+
             # Apply ocean mask to gradients (zero out land gradients)
             with torch.no_grad():
                 # Ensure ocean_mask matches channel dimension of gradients
@@ -242,92 +239,84 @@ class ICOptimizer:
                         f"Ocean mask channels ({ocean_mask.shape[0]}) != gradients channels ({filtered_gradients.shape[2]}). Adjusting mask."
                     )
                     if ocean_mask.shape[0] >= filtered_gradients.shape[2]:
-                        ocean_mask = ocean_mask[:filtered_gradients.shape[2], :, :]
+                        ocean_mask = ocean_mask[: filtered_gradients.shape[2], :, :]
                     else:
                         raise ValueError(
                             f"Ocean mask has fewer channels ({ocean_mask.shape[0]}) than gradients ({filtered_gradients.shape[2]})."
                         )
 
                 masked_gradients = filtered_gradients * ocean_mask.unsqueeze(0).unsqueeze(0)
-                
+
                 # Gradient descent update
                 x0_current = x0_current - self.learning_rate * masked_gradients
-                
+
                 # Ensure x0_current requires grad for next iteration
                 x0_current = x0_current.detach().requires_grad_(True)
-            
+
             # Compute metrics (with no_grad to save memory)
             with torch.no_grad():
                 # Use last forecast step for evaluation
                 y_hat_final = y_hat_steps[:, -1, :, :, :]
                 target_final = target_sequence[:, -1, :, :, :]
-                
+
                 metrics = self.metrics_computer.compute_all_metrics(
                     y_hat_final,
                     target_final,
                     x0_current,
                     x0_reference,
-                    regional_masks=regional_masks
+                    regional_masks=regional_masks,
                 )
-            
+
             # Track best solution
             if loss.item() < self.best_loss:
                 self.best_loss = loss.item()
                 self.best_iteration = iteration + 1
                 self.best_x0 = x0_current.detach().clone()
                 self.best_predictions = y_hat_steps.detach().clone()
-            
+
             # Store history
             history_entry = {
-                'iteration': iteration + 1,
-                'loss': loss.item(),
-                'kernel_size': current_kernel,
-                'per_variable_loss': {
+                "iteration": iteration + 1,
+                "loss": loss.item(),
+                "kernel_size": current_kernel,
+                "per_variable_loss": {
                     k: v.mean().item() if torch.is_tensor(v) else v
-                    for k, v in loss_details['per_variable'].items()
+                    for k, v in loss_details["per_variable"].items()
                 },
-                'rmse_global': metrics['rmse_global'],
-                'ic_rmse': metrics['ic_rmse'],
+                "rmse_global": metrics["rmse_global"],
+                "ic_rmse": metrics["ic_rmse"],
             }
-            
+
             if regional_masks is not None:
-                history_entry['rmse_basin'] = metrics['rmse_basin']
-            
+                history_entry["rmse_basin"] = metrics["rmse_basin"]
+
             self.history.append(history_entry)
-            
+
             # Logging to TensorBoard
             if (iteration + 1) % self.log_frequency == 0:
-                self._log_to_tensorboard(
-                    iteration + 1,
-                    loss_details,
-                    metrics,
-                    current_kernel
-                )
-            
+                self._log_to_tensorboard(iteration + 1, loss_details, metrics, current_kernel)
+
             # Log histograms/embeddings less frequently
             if (iteration + 1) % self.histogram_frequency == 0:
                 self._log_histograms_to_tensorboard(
-                    iteration + 1,
-                    masked_gradients,
-                    x0_current,
-                    ocean_mask
+                    iteration + 1, masked_gradients, x0_current, ocean_mask
                 )
-            
+
             # Print progress
             if (iteration + 1) % self.save_frequency == 0 or iteration == 0:
                 self._print_progress(iteration + 1, loss.item(), metrics, current_kernel)
-            
+
             # Save checkpoint
             if (iteration + 1) % self.save_frequency == 0:
                 self._save_checkpoint(iteration + 1, x0_current, y_hat_steps)
-            
+
             # Memory cleanup
             del y_hat_steps, loss, gradients, filtered_gradients, masked_gradients
             if iteration % 50 == 0:
                 gc.collect()
                 if self.device == "cuda":
                     torch.cuda.empty_cache()
-        
+
         # Final logging
         logger.info(f"\n{'='*60}")
         logger.info("Optimization Complete")
@@ -335,33 +324,29 @@ class ICOptimizer:
         logger.info(f"Best loss: {self.best_loss:.6f} (iteration {self.best_iteration})")
         logger.info(f"Final loss: {self.history[-1]['loss']:.6f}")
         logger.info(f"{'='*60}\n")
-        
+
         # Save final results
         results = {
-            'history': self.history,
-            'best_loss': self.best_loss,
-            'best_iteration': self.best_iteration,
-            'initial_loss': initial_loss.item(),
-            'final_loss': self.history[-1]['loss'],
+            "history": self.history,
+            "best_loss": self.best_loss,
+            "best_iteration": self.best_iteration,
+            "initial_loss": initial_loss.item(),
+            "final_loss": self.history[-1]["loss"],
         }
-        
+
         self._save_final_results(results)
-        
+
         # Close TensorBoard writer
         self.writer.close()
-        
+
         return self.best_x0, results
-    
+
     def _log_to_tensorboard(
-        self,
-        iteration: int,
-        loss_details: Dict,
-        metrics: Dict,
-        kernel_size: int
+        self, iteration: int, loss_details: Dict, metrics: Dict, kernel_size: int
     ):
         """
         Log metrics to TensorBoard.
-        
+
         Follows R8 decision on TensorBoard hierarchy:
         loss/J_obs/{total,ssh,sst,uo,vo}
         metrics/rmse/{global,basin}/{var}
@@ -369,41 +354,41 @@ class ICOptimizer:
         state/ic/{norm,update_magnitude}
         """
         # Loss metrics (per-variable)
-        per_var = loss_details['per_variable']
-        self.writer.add_scalar('loss/J_obs/total', per_var['total'].mean().item(), iteration)
-        self.writer.add_scalar('loss/J_obs/ssh', per_var['ssh'].mean().item(), iteration)
-        self.writer.add_scalar('loss/J_obs/sst', per_var['sst'].mean().item(), iteration)
-        self.writer.add_scalar('loss/J_obs/sss', per_var['sss'].mean().item(), iteration)
-        self.writer.add_scalar('loss/J_obs/uo', per_var['uo'].mean().item(), iteration)
-        self.writer.add_scalar('loss/J_obs/vo', per_var['vo'].mean().item(), iteration)
-        
+        per_var = loss_details["per_variable"]
+        self.writer.add_scalar("loss/J_obs/total", per_var["total"].mean().item(), iteration)
+        self.writer.add_scalar("loss/J_obs/ssh", per_var["ssh"].mean().item(), iteration)
+        self.writer.add_scalar("loss/J_obs/sst", per_var["sst"].mean().item(), iteration)
+        self.writer.add_scalar("loss/J_obs/sss", per_var["sss"].mean().item(), iteration)
+        self.writer.add_scalar("loss/J_obs/uo", per_var["uo"].mean().item(), iteration)
+        self.writer.add_scalar("loss/J_obs/vo", per_var["vo"].mean().item(), iteration)
+
         # RMSE metrics (global)
-        for var, rmse in metrics['rmse_global'].items():
-            self.writer.add_scalar(f'metrics/rmse/global/{var}', rmse, iteration)
-        
+        for var, rmse in metrics["rmse_global"].items():
+            self.writer.add_scalar(f"metrics/rmse/global/{var}", rmse, iteration)
+
         # RMSE metrics (basin-stratified)
-        if 'rmse_basin' in metrics:
-            for region, var_dict in metrics['rmse_basin'].items():
+        if "rmse_basin" in metrics:
+            for region, var_dict in metrics["rmse_basin"].items():
                 for var, rmse in var_dict.items():
-                    self.writer.add_scalar(f'metrics/rmse/{region}/{var}', rmse, iteration)
-        
+                    self.writer.add_scalar(f"metrics/rmse/{region}/{var}", rmse, iteration)
+
         # IC RMSE
-        for var, rmse in metrics['ic_rmse'].items():
-            self.writer.add_scalar(f'metrics/ic_rmse/{var}', rmse, iteration)
-        
+        for var, rmse in metrics["ic_rmse"].items():
+            self.writer.add_scalar(f"metrics/ic_rmse/{var}", rmse, iteration)
+
         # Pooling kernel size
-        self.writer.add_scalar('state/pooling_kernel', kernel_size, iteration)
-    
+        self.writer.add_scalar("state/pooling_kernel", kernel_size, iteration)
+
     def _log_histograms_to_tensorboard(
         self,
         iteration: int,
         gradients: torch.Tensor,
         x0_current: torch.Tensor,
-        ocean_mask: torch.Tensor
+        ocean_mask: torch.Tensor,
     ):
         """
         Log histograms and embeddings to TensorBoard.
-        
+
         Args:
             iteration: Current iteration
             gradients: Filtered gradients [B, T, C, H, W]
@@ -411,40 +396,30 @@ class ICOptimizer:
             ocean_mask: Ocean mask [C, H, W]
         """
         # Gradient histograms (per channel, using last timestep)
-        var_names = ['SSH', 'T', 'S', 'U', 'V']
+        var_names = ["SSH", "T", "S", "U", "V"]
         for ch_idx, var_name in enumerate(var_names):
             grad_ch = gradients[0, -1, ch_idx]  # [H, W]
             ocean_points = grad_ch[ocean_mask[ch_idx] > 0]
-            
+
             if ocean_points.numel() > 0:
                 self.writer.add_histogram(
-                    f'gradients/{var_name}',
-                    ocean_points.detach().cpu().numpy(),
-                    iteration
+                    f"gradients/{var_name}", ocean_points.detach().cpu().numpy(), iteration
                 )
-        
+
         # IC histograms (per channel, using last timestep)
         for ch_idx, var_name in enumerate(var_names):
             ic_ch = x0_current[0, -1, ch_idx]  # [H, W]
             ocean_points = ic_ch[ocean_mask[ch_idx] > 0]
-            
+
             if ocean_points.numel() > 0:
                 self.writer.add_histogram(
-                    f'state/ic/{var_name}',
-                    ocean_points.detach().cpu().numpy(),
-                    iteration
+                    f"state/ic/{var_name}", ocean_points.detach().cpu().numpy(), iteration
                 )
-    
-    def _print_progress(
-        self,
-        iteration: int,
-        loss: float,
-        metrics: Dict,
-        kernel_size: int
-    ):
+
+    def _print_progress(self, iteration: int, loss: float, metrics: Dict, kernel_size: int):
         """
         Print optimization progress.
-        
+
         Args:
             iteration: Current iteration
             loss: Current loss value
@@ -458,61 +433,62 @@ class ICOptimizer:
         logger.info(f"Loss: {loss:.6f}")
         logger.info(f"Best Loss: {self.best_loss:.6f} (iteration {self.best_iteration})")
         logger.info("Global RMSE:")
-        for var, rmse in metrics['rmse_global'].items():
+        for var, rmse in metrics["rmse_global"].items():
             logger.info(f"  {var:8s}: {rmse:.6e}")
         logger.info("IC RMSE:")
-        for var, rmse in metrics['ic_rmse'].items():
+        for var, rmse in metrics["ic_rmse"].items():
             logger.info(f"  {var:8s}: {rmse:.6e}")
         logger.info(f"{'='*60}\n")
-    
-    def _save_checkpoint(
-        self,
-        iteration: int,
-        x0_current: torch.Tensor,
-        predictions: torch.Tensor
-    ):
+
+    def _save_checkpoint(self, iteration: int, x0_current: torch.Tensor, predictions: torch.Tensor):
         """
         Save checkpoint to experiment's checkpoints/ directory.
-        
+
         Args:
             iteration: Current iteration
             x0_current: Current IC
             predictions: Current predictions
         """
         checkpoint_path = self.checkpoint_dir / f"checkpoint_iter{iteration}.pt"
-        
-        torch.save({
-            'iteration': iteration,
-            'x0': x0_current.detach().cpu(),
-            'predictions': predictions.detach().cpu(),
-            'loss': self.history[-1]['loss'],
-            'best_loss': self.best_loss,
-            'best_iteration': self.best_iteration,
-        }, checkpoint_path)
-        
+
+        torch.save(
+            {
+                "iteration": iteration,
+                "x0": x0_current.detach().cpu(),
+                "predictions": predictions.detach().cpu(),
+                "loss": self.history[-1]["loss"],
+                "best_loss": self.best_loss,
+                "best_iteration": self.best_iteration,
+            },
+            checkpoint_path,
+        )
+
         logger.info(f"Saved checkpoint: {checkpoint_path}")
-    
+
     def _save_final_results(self, results: Dict):
         """
         Save final optimization results to experiment directory.
-        
+
         Args:
             results: Results dictionary
         """
         # Save history as JSON to metrics/
         history_path = self.metrics_dir / "optimization_history.json"
-        with open(history_path, 'w') as f:
+        with open(history_path, "w") as f:
             json.dump(results, f, indent=2)
-        
+
         logger.info(f"Saved history: {history_path}")
-        
+
         # Save best IC and predictions to exp root
         best_path = self.exp_dir / "best_solution.pt"
-        torch.save({
-            'x0': self.best_x0.cpu(),
-            'predictions': self.best_predictions.cpu(),
-            'iteration': self.best_iteration,
-            'loss': self.best_loss,
-        }, best_path)
-        
+        torch.save(
+            {
+                "x0": self.best_x0.cpu(),
+                "predictions": self.best_predictions.cpu(),
+                "iteration": self.best_iteration,
+                "loss": self.best_loss,
+            },
+            best_path,
+        )
+
         logger.info(f"Saved best solution: {best_path}")

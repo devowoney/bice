@@ -18,6 +18,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 import logging
+
 logger = logging.getLogger(__name__)
 
 import hydra
@@ -42,15 +43,15 @@ from gd_optimic.gradient import ScheduledPooling
 def setup_slurm_environment(cfg: DictConfig) -> DictConfig:
     """
     Detect and configure SLURM environment.
-    
+
     Automatically sets:
     - GPU device(s) from SLURM_GPUS
     - num_workers based on available CPUs
     - output paths with job ID
-    
+
     Args:
         cfg: Hydra configuration
-        
+
     Returns:
         Updated configuration with SLURM settings
     """
@@ -60,17 +61,17 @@ def setup_slurm_environment(cfg: DictConfig) -> DictConfig:
     gpus = os.environ.get("SLURM_GPUS", "0")
     cpus_per_task = os.environ.get("SLURM_CPUS_PER_TASK", "4")
     job_name = os.environ.get("SLURM_JOB_NAME", "optimization")
-    
+
     # Log SLURM info
-    logger.info("\n" + "="*60)
+    logger.info("\n" + "=" * 60)
     logger.info("SLURM Environment Detection")
-    logger.info("="*60)
+    logger.info("=" * 60)
     logger.info(f"Job ID: {job_id}")
     logger.info(f"Job Name: {job_name}")
     logger.info(f"N Tasks: {ntasks}")
     logger.info(f"GPUs: {gpus}")
     logger.info(f"CPUs per task: {cpus_per_task}")
-    
+
     # Verify GPU availability
     if torch.cuda.is_available():
         n_gpus = torch.cuda.device_count()
@@ -80,34 +81,34 @@ def setup_slurm_environment(cfg: DictConfig) -> DictConfig:
             logger.info(f"  GPU {i}: {props.name}")
     else:
         logger.warning("No GPU detected - will use CPU (slow!)")
-    
-    logger.info("="*60 + "\n")
-    
+
+    logger.info("=" * 60 + "\n")
+
     # Update config with SLURM settings
     cfg.compute.num_workers = min(int(cpus_per_task), 4)
-    
+
     # # Append job ID to output directory
     # if job_id != "local":
     #     job_suffix = f"_job{job_id}"
     #     cfg.logging.output_dir = cfg.logging.output_dir + job_suffix
-    
+
     return cfg
 
 
 def setup_logging(cfg: DictConfig):
     """
     Configure Python logging.
-    
+
     Args:
         cfg: Hydra configuration
     """
     log_level = os.environ.get("LOG_LEVEL", "INFO")
-    
+
     logging.basicConfig(
         level=getattr(logging, log_level),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    
+
     logger = logging.getLogger(__name__)
     logger.info(f"Logging level: {log_level}")
 
@@ -115,13 +116,13 @@ def setup_logging(cfg: DictConfig):
 def setup_reproducibility(seed: int = 42):
     """
     Set up reproducibility (A5 - scientific integrity).
-    
+
     Args:
         seed: Random seed
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
-    
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
@@ -133,48 +134,48 @@ def setup_reproducibility(seed: int = 42):
 def main(cfg: DictConfig):
     """
     Main optimization function with SLURM integration.
-    
+
     Args:
         cfg: Hydra configuration
     """
     # Setup SLURM environment
     cfg = setup_slurm_environment(cfg)
-    
+
     # Setup logging
     setup_logging(cfg)
-    
+
     # Setup reproducibility (A5)
     setup_reproducibility(seed=42)
-    
-    logger.info("\n" + "="*60)
+
+    logger.info("\n" + "=" * 60)
     logger.info("IC Optimization with SLURM Integration")
-    logger.info("="*60)
+    logger.info("=" * 60)
     logger.debug("Configuration:\n" + OmegaConf.to_yaml(cfg))
-    logger.info("="*60 + "\n")
-    
+    logger.info("=" * 60 + "\n")
+
     device = cfg.compute.device if torch.cuda.is_available() else "cpu"
     cfg.compute.device = device
     logger.info(f"Using device: {device}")
-    
+
     # Generate experiment ID
     if cfg.logging.auto_generate_exp_id:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         exp_id = f"{cfg.experiment.name}_{timestamp}"
     else:
         exp_id = cfg.experiment.name
-    
+
     logger.info(f"Experiment ID: {exp_id}\n")
-    # Create experiment directory under the configured base output_dir (e.g., runs/{exp_id})
-    base_output = Path(cfg.logging.output_dir)
-    exp_output_dir = base_output / exp_id
-    exp_output_dir.mkdir(parents=True, exist_ok=True)
+    # # Create experiment directory under the configured base output_dir (e.g., runs/{exp_id})
+    # base_output = Path(cfg.logging.output_dir)
+    # exp_output_dir = base_output / exp_id
+    exp_output_dir = Path(".")
+    # exp_output_dir.mkdir(parents=True, exist_ok=True)
     # Save a copy of the active config to the experiment folder for reproducibility
     cfg_path = exp_output_dir / "config.yaml"
     with open(cfg_path, "w") as cf:
         cf.write(OmegaConf.to_yaml(cfg))
     logger.info(f"Experiment directory created: {exp_output_dir}")
 
-    
     # -------------------------------------------------------------------------
     # 1. Load Dataset
     # -------------------------------------------------------------------------
@@ -182,80 +183,80 @@ def main(cfg: DictConfig):
     dataset = GlonetDataset(
         data_path=cfg.data.root_path,
         data_files=cfg.data.init_state_files,
-        ssh_obs_files=cfg.data.ssh_obs_files if cfg.observations.mode != 'full' else None,
-        sst_obs_files=cfg.data.sst_obs_files if cfg.observations.mode != 'full' else None,
-        lazy_load=True
+        ssh_obs_files=cfg.data.ssh_obs_files if cfg.observations.mode != "full" else None,
+        sst_obs_files=cfg.data.sst_obs_files if cfg.observations.mode != "full" else None,
+        lazy_load=True,
     )
-    
+
     # Extract sequences
     input_sequence = dataset.get_sequence(
-        start_idx=cfg.data.sample_idx,
-        length=cfg.data.sequence_length
+        start_idx=cfg.data.sample_idx, length=cfg.data.sequence_length
     )
-    
+
     target_start_idx = cfg.data.sample_idx + cfg.data.sequence_length
     target_end_idx = target_start_idx + cfg.data.observation_length
     target_sequence = dataset.get_sequence(
-        start_idx=target_start_idx,
-        length=cfg.data.observation_length
+        start_idx=target_start_idx, length=cfg.data.observation_length
     )
-    
+
     logger.info(f"Loaded dataset")
     logger.debug(f"  Input sequence: {input_sequence['data'].shape}")
-    logger.debug(f"  Target sequence: {target_sequence['data'].shape}")    
+    logger.debug(f"  Target sequence: {target_sequence['data'].shape}")
     # -------------------------------------------------------------------------
     # 2. Apply Observation Operators
     # -------------------------------------------------------------------------
     logger.info("Applying observation operators...")
     obs_operator = ObservationOperator(device=device)
-    
+
     ssh_mask = None
     sst_mask = None
-    
-    if cfg.observations.mode != 'full':
+
+    if cfg.observations.mode != "full":
         ssh_obs = dataset.get_ssh_obs(target_start_idx, cfg.data.observation_length)
         target_sequence, ssh_mask = obs_operator.apply_ssh_operator(
             target_sequence, ssh_obs, cfg.observations.mode
         )
-        
+
         sst_obs = dataset.get_sst_obs(target_start_idx, cfg.data.observation_length)
         target_sequence, sst_mask = obs_operator.apply_sst_operator(
             target_sequence, sst_obs, cfg.observations.mode
         )
-    
-    logger.info(f"Applied observation operators (mode: {cfg.observations.mode})")    
+
+    logger.info(f"Applied observation operators (mode: {cfg.observations.mode})")
     # -------------------------------------------------------------------------
     # 3. Create Masks
     # -------------------------------------------------------------------------
     logger.info("Creating masks...")
     mask_builder = MaskBuilder(device=device)
-    
-    sample_data = dataset.dataset.isel(time=cfg.data.sample_idx)['data'].values
+
+    sample_data = dataset.dataset.isel(time=cfg.data.sample_idx)["data"].values
     ocean_mask = mask_builder.build_ocean_mask(sample_data)
-    
+
     obs_mask = mask_builder.build_obs_mask(
         ocean_mask,
         cfg.data.observation_length,
         ssh_nanmask=ssh_mask,
         sst_nanmask=sst_mask,
-        obs_mode=cfg.observations.mode
+        obs_mode=cfg.observations.mode,
     )
-    
-    logger.info("Created masks")    
+
+    logger.info("Created masks")
     # -------------------------------------------------------------------------
     # 4. Prepare Data Tensors
     # -------------------------------------------------------------------------
     logger.info("Preparing data tensors...")
-    
-    input_data = input_sequence['data'].values
+
+    input_data = input_sequence["data"].values
     input_data = np.nan_to_num(input_data, nan=0.0)
     x0_init = torch.from_numpy(input_data[:, 0:5, :, :].copy()).float().unsqueeze(0).to(device)
-    
-    target_data = target_sequence['data'].values
+
+    target_data = target_sequence["data"].values
     target_data = np.nan_to_num(target_data, nan=0.0)
-    target_tensor = torch.from_numpy(target_data[:, 0:5, :, :].copy()).float().unsqueeze(0).to(device)
-    
-    logger.info("Prepared tensors")    
+    target_tensor = (
+        torch.from_numpy(target_data[:, 0:5, :, :].copy()).float().unsqueeze(0).to(device)
+    )
+
+    logger.info("Prepared tensors")
     # -------------------------------------------------------------------------
     # 5. Initialize Forward Model
     # -------------------------------------------------------------------------
@@ -264,10 +265,10 @@ def main(cfg: DictConfig):
         model_path=str(Path(cfg.model.location) / cfg.model.checkpoint_files.part1),
         normalizer_path=cfg.model.location,
         device=device,
-        use_gradient_checkpointing=cfg.model.use_gradient_checkpointing
+        use_gradient_checkpointing=cfg.model.use_gradient_checkpointing,
     )
     logger.info("Initialized forward model")
-    
+
     # -------------------------------------------------------------------------
     # 6. Initialize Loss Function
     # -------------------------------------------------------------------------
@@ -275,19 +276,16 @@ def main(cfg: DictConfig):
     loss_fn = ObservationLoss(
         obs_mask=obs_mask,
         loss_weighting=cfg.loss.weighting,
-        manual_weights=cfg.loss.manual_weights if cfg.loss.weighting == 'manual' else None,
-        device=device
+        manual_weights=cfg.loss.manual_weights if cfg.loss.weighting == "manual" else None,
+        device=device,
     )
-    logger.info("Initialized loss function")    
+    logger.info("Initialized loss function")
     # -------------------------------------------------------------------------
     # 7. Initialize Gradient Filter
     # -------------------------------------------------------------------------
     logger.info("Initializing gradient filter...")
-    gradient_filter = GradientFilter(
-        filter_type=cfg.optimization.gradient_filter,
-        device=device
-    )
-    
+    gradient_filter = GradientFilter(filter_type=cfg.optimization.gradient_filter, device=device)
+
     scheduled_pooling = None
     if cfg.optimization.use_scheduled_pooling:
         scheduled_pooling = ScheduledPooling(
@@ -296,21 +294,21 @@ def main(cfg: DictConfig):
             initial_kernel=cfg.optimization.pooling_schedule.initial_kernel,
             final_kernel=cfg.optimization.pooling_schedule.final_kernel,
             schedule_steps=cfg.optimization.pooling_schedule.schedule_steps,
-            kernel_sizes=cfg.optimization.pooling_schedule.kernel_sizes
+            kernel_sizes=cfg.optimization.pooling_schedule.kernel_sizes,
         )
     logger.info("Initialized gradient filter")
-    
+
     # -------------------------------------------------------------------------
     # 8. Initialize Metrics Computer
     # -------------------------------------------------------------------------
     logger.info("Initializing metrics computer...")
     metrics_computer = MetricsComputer(ocean_mask=ocean_mask, device=device)
-    logger.info("Initialized metrics computer")    
+    logger.info("Initialized metrics computer")
     # -------------------------------------------------------------------------
     # 9. Initialize Optimizer
     # -------------------------------------------------------------------------
     logger.info("Initializing optimizer...")
-    
+
     # Create output directories following project structure
     optimizer = ICOptimizer(
         forward_model=forward_model,
@@ -327,33 +325,33 @@ def main(cfg: DictConfig):
         save_frequency=cfg.logging.save_frequency,
         log_frequency=cfg.logging.log_frequency,
         histogram_frequency=cfg.logging.histogram_frequency,
-        scheduled_pooling=scheduled_pooling
+        scheduled_pooling=scheduled_pooling,
     )
     logger.info("Initialized optimizer")
-    
+
     # -------------------------------------------------------------------------
     # 10. Run Optimization
     # -------------------------------------------------------------------------
     logger.info("Starting optimization...")
-    
+
     best_x0, results = optimizer.optimize(
         x0_init=x0_init,
         target_sequence=target_tensor,
         ocean_mask=ocean_mask,
         exp_id=exp_id,
-        regional_masks=None
+        regional_masks=None,
     )
-    
-    logger.info("\n" + "="*60)
+
+    logger.info("\n" + "=" * 60)
     logger.info("Optimization Complete!")
-    logger.info("="*60)
+    logger.info("=" * 60)
     logger.info(f"Best loss: {results['best_loss']:.6f} (iteration {results['best_iteration']})")
     logger.info(f"Initial loss: {results['initial_loss']:.6f}")
     logger.info(f"Final loss: {results['final_loss']:.6f}")
-    improvement = (1 - results['final_loss'] / results['initial_loss']) * 100
+    improvement = (1 - results["final_loss"] / results["initial_loss"]) * 100
     logger.info(f"Improvement: {improvement:.2f}%")
-    logger.info("="*60 + "\n")
-    
+    logger.info("=" * 60 + "\n")
+
     exp_output_dir = Path(cfg.logging.output_dir) / exp_id
     logger.info(f"Results saved to: {exp_output_dir}")
 
