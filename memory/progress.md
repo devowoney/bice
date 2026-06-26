@@ -159,3 +159,27 @@
 
 ## Pending / blockers
 - R10(j) — Author `src/gd_optimic/` package: ready to proceed (all research items locked).
+
+## 2026-06-12 — R10(j) (Production Optimization Package) — IMPLEMENTED
+
+- **Package:** `src/gd_optimic/` (~2700 lines, 6 OOP modules + Hydra config)
+- **Modules:**
+  1. **data.py**: `GlonetDataset` + `ObservationOperator` (R2-compliant SSH/SST operators)
+  2. **loss.py**: `ObservationLoss` (J_obs with observation masking, dynamic/manual weighting)
+  3. **gradient.py**: `GradientFilter` + `ScheduledPooling` (multigrid optimization)
+  4. **optimizer.py**: `ICOptimizer` (main loop with TensorBoard logging per R8 hierarchy)
+  5. **metrics.py**: `MetricsComputer` (R4 RMSE) + `PSDComputer` (Phase P)
+  6. **utils.py**: `MaskBuilder` + `ForwardModel` + normalizers
+
+- **Configuration:** Hydra YAML (`configs/optimize_ic.yaml`) for explicit parameter management
+- **Entry Point:** `src/run_optimization.py` (Hydra CLI)
+- **Usage:**
+  ```bash
+  python run_optimization.py                           # Default config
+  python run_optimization.py observations.mode=simulated  # Override params
+  ```
+
+- **Phase 1 Scope:** J_obs only. J_b (background) + J_q (model error) deferred to Phase 1.b.
+- **CS1 Compliance:** Human-readable, extensively commented, simple structure
+- **Scientific Integrity:** Enforces A1 (frozen model), A2 (obs/eval separation), A5 (reproducibility)
+- **Status:** R10(j) complete ✅ | **Phase B research 10/10 complete** → ready for Phase P (Professor)

@@ -300,3 +300,42 @@
 - R8 — Experiment-tracking conventions (TensorBoard tag scheme): pending.
 - R9 — Differentiability sanity check: pending user OK + checkpoint path confirmation.
 - R10(j) — Author `src/gd_optimic/` package: pending R4 finalization.
+
+## 2026-06-12 — R10(j): Production Optimization Package — IMPLEMENTED
+
+**Decision**: Implemented `src/gd_optimic/` as object-oriented package with Hydra configuration.
+
+**Components**:
+1. **data.py**: `GlonetDataset` + `ObservationOperator` (R2-compliant SSH/SST operators)
+2. **loss.py**: `ObservationLoss` (J_obs with observation masking, dynamic/manual weighting)
+3. **gradient.py**: `GradientFilter` + `ScheduledPooling` (multigrid optimization)
+4. **optimizer.py**: `ICOptimizer` (main loop with TensorBoard logging per R8 hierarchy)
+5. **metrics.py**: `MetricsComputer` (R4 RMSE) + `PSDComputer` (Phase P)
+6. **utils.py**: `MaskBuilder` + `ForwardModel` + normalizers
+
+**Configuration**: Hydra YAML (`configs/optimize_ic.yaml`) manages all parameters explicitly:
+- Experiment metadata (name, description)
+- Data paths (GLORYS12, SSH obs, SST obs)
+- Model checkpoints (glonet v1)
+- Observation mode (full/simulated/real - A2 compliant)
+- Loss weighting (dynamic/manual)
+- Optimization (learning rate, num iterations, gradient filter, scheduled pooling)
+- Metrics (RMSE global/basin, PSD deferred to Phase P)
+- Logging (TensorBoard hierarchy per R8, save frequency)
+
+**Entry Point**: `src/run_optimization.py` uses Hydra for CLI:
+```bash
+python run_optimization.py                           # Default config
+python run_optimization.py observations.mode=simulated  # Override params
+```
+
+**Phase 1 Scope**: J_obs only (observation term). J_b (background) + J_q (model error) deferred to Phase 1.b.
+
+**Scientific Integrity**:
+- A1 enforced: model.parameters().requires_grad = False
+- A2 enforced: observation mode determines truth source
+- A5 enforced: random seeds, deterministic algorithms
+
+**CS1 Compliance**: All code human-readable, extensively commented, simple structure.
+
+**Status**: R10(j) complete ✅ | Phase B research 10/10 complete → ready for Phase P

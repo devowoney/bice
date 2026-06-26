@@ -1,0 +1,184 @@
+# Hydra configuration for IC optimization
+# This config manages all optimization parameters following R8 tracking conventions
+
+# Experiment metadata
+experiment:
+  name: "refIC_fullobs"  # Short name for experiment type
+  description: "Initial condition optimization with full observations (idealized twin)"
+  timestamp: ${now:%Y-%m-%d_%H-%M-%S}  # Auto-generated at runtime
+
+#  Hydra output
+  #  Align output directory with main script
+hydra:
+  run:
+    dir: .tmp/runs/${experiment.name}_${experiment.timestamp}
+  sweep:
+    dir: .tmp/multiruns/${experiment.name}_${experiment.timestamp}
+  job:
+    chdir: true 
+    name: ${experiment.name} 
+
+# Data configuration
+data:
+  root_path: "/Odyssey/public/glonet"
+  
+  # GLORYS12 initial states
+  init_state_files:
+    - "glorys12_2021-01-01_to_2021-12-31_init_states/combined_input_2021-01-01_to_2021-02-15.nc"
+    - "glorys12_2021-01-01_to_2021-12-31_init_states/combined_input_2021-02-16_to_2021-04-02.nc"
+  
+  # SSH observations (altimetry)
+  ssh_obs_files:
+    - "/Odyssey/public/altimetry_traces/2010_2023/gridded/sla_l3_all_2010_2023_0.25deg_convl4.nc"
+  
+  # SST observations (ODYSSEA)
+  sst_obs_files:
+    - "ODYSSEA_SST_2021-01-01_to_2021-12-31/combined_obs_2021-01-01_to_2021-04-02.nc"
+  
+  # Mean dynamic topography (for real SSH obs)
+  mdt_file: null  # Set when using obs_mode='real'
+  
+  # Variance map (for regional masking)
+  variance_ssh_path: "/Odyssey/public/data_challenge_ssh_ose/data/sad/variance_cmems_dt_allsat.nc"
+  
+  # Sample selection
+  sample_idx: 0  # Starting time index
+  sequence_length: 2  # IC sequence length (glonet requires T=2)
+  observation_length: 7  # Number of observation time steps
+  forecast_horizon: 21  # Total forecast horizon (for extended analysis)
+
+# Model configuration
+model:
+  location: "/Odyssey/public/glonet/TrainedWeights"
+  checkpoint_files:
+    part1: "glonet_part1.pth"  # Surface model (5 channels)
+  use_gradient_checkpointing: true  # Memory-efficient backprop
+
+# Observation configuration (A2-compliant)
+observations:
+  mode: "full"  # Options: 'full', 'simulated', 'real'
+                 # 'full': GLORYS12 everywhere (idealized twin/ceiling check)
+                 # 'simulated': GLORYS12 with realistic obs coverage (OSSE)
+                 # 'real': Satellite SSH + SST (OSE)
+  
+  # Observation operators follow R2 decisions
+  ssh_operator: "nearest_neighbor"  # Along-track → nearest-neighbor interpolation
+  sst_operator: "direct_pixel"      # Gridded L3 → direct pixel match
+  qc_strategy: "light"              # Trust CMEMS L3 pre-filtering
+
+# Loss configuration
+loss:
+  weighting: "manual"  # Options: 'dynamic', 'manual'
+                        # 'dynamic': Automatically balance loss magnitudes
+                        # 'manual': Use manual_weights below
+  
+  manual_weights:  # Weights for [SSH, T, S, U, V] if weighting='manual'
+    - 1.0  # SSH
+    - 1.0  # T
+    - 1.0  # S
+    - 1.0  # U
+    - 1.0  # V
+
+# Optimization configuration
+optimization:
+  learning_rate: 10
+  num_iterations: 300
+  
+  # Gradient filtering
+  gradient_filter: "pooling"  # Options: 'none', 'weight', 'delta', 'pooling', 'pooling+weight'
+  
+  # Scheduled pooling (multigrid optimization)
+  use_scheduled_pooling: false
+  pooling_schedule:
+    type: "step"  # Options: 'step', 'linear', 'exponential'
+    
+    # Step schedule (recommended)
+    initial_kernel: 24  # Starting kernel size (coarse)
+    final_kernel: 1     # Ending kernel size (fine)
+    schedule_steps:     # Iterations to change kernel
+      - 100
+      - 200
+      - 300
+      - 400
+      - 500
+      - 600
+      - 700
+      - 800
+      - 900
+    kernel_sizes:       # Corresponding kernel sizes at each step
+      - 24  # [0, 100)
+      - 8   # [100, 200)
+      - 4   # [200, 300)
+      - 2   # [300, 400)
+      - 1   # [400, 500)
+      - 4   # [500, 600) - coarsen again
+      - 1   # [600, 700)
+      - 4   # [700, 800) - coarsen again
+      - 1   # [800, 900)
+      - 2   # [900, 1000)
+      - 1   # [1000+]
+
+# Metrics configuration (follows R4 decisions)
+metrics:
+  # RMSE metrics
+  compute_rmse_global: true           # Per-variable RMSE (SSH, T, S, U, V)
+  compute_rmse_basin: true            # Basin-stratified RMSE
+  
+  # Regional masks for basin-stratified RMSE
+  regions:
+    - "global"
+    - "gulf_stream"
+    - "high_var"
+    - "low_var"
+  
+  # High-variance threshold (for regional masking)
+  high_var_threshold: 0.02  # m^2 (SLA variance)
+  
+  # PSD metrics (Phase P - after initial runs)
+  compute_psd: false
+  psd_n_bins: 30
+  psd_mesoscale_band: [0.002, 0.02]  # cycle/km (50-500 km wavelength)
+
+# Logging configuration (follows R8 decisions)
+logging:
+  # TensorBoard hierarchy: loss/J_obs/{total,ssh,sst,uo,vo}
+  #                        metrics/rmse/{global,basin}/{var}
+  #                        metrics/gradient/norm/{total,per_channel}
+  #                        state/ic/{norm,update_magnitude}
+  
+  # Output structure: .tmp/outputs/{exp_id}_{timestamp}/
+  #   ├── config.yaml
+  #   ├── checkpoints/
+  #   ├── tb/                    (TensorBoard logs)
+  #   ├── metrics/
+  #   └── optimization_history.json
+  
+  # Base directory for experiment runs. Top-level folder 'runs/' will contain
+  # per-experiment folders named {exp_name}_{timestamp}.
+  output_dir: ".tmp/runs"
+  tensorboard_subdir: "tb"      # TensorBoard under {exp_id}/tb/
+  checkpoints_subdir: "checkpoints"
+  metrics_subdir: "metrics"
+  
+  log_frequency: 1              # Log metrics every N iterations
+  histogram_frequency: 100       # Log histograms/embeddings every N iterations
+  save_frequency: 50           # Save checkpoint every N iterations
+  
+  # Experiment ID format: {exp_name}_{timestamp}
+  # Example: refIC_fullobs_2026-06-12_15-30-45
+  auto_generate_exp_id: true
+
+# Compute configuration
+compute:
+  device: "cuda"  # Options: 'cuda', 'cpu'
+  num_workers: 4  # Data loading workers
+
+# Scientific integrity constraints (enforced by code)
+# A1: Frozen-model invariant - model weights never updated
+# A2: Strict obs/eval separation - observation mode determines truth source
+# A3: Honest baselines - persistence baseline always included
+# A4: Physical plausibility - land mask enforced, no unrealistic values
+# A5: Full reproducibility - random seeds, deterministic algorithms
+# A6: No cherry-picking - all experiments logged, no selective reporting
+# A7: OSE/OSSE separation - never mix real and simulated observations
+# A8: Disclosed limitations - document all assumptions and constraints
