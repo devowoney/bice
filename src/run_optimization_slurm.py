@@ -198,10 +198,17 @@ def main(cfg: DictConfig):
     target_sequence = dataset.get_sequence(
         start_idx=target_start_idx, length=cfg.data.observation_length
     )
+    
+    # Load full ground truth for RMSE diagnostics (T=0 to T=forecast_horizon)
+    ground_truth_end_idx = target_start_idx + cfg.data.forecast_horizon
+    ground_truth_sequence = dataset.get_sequence(
+        start_idx=target_start_idx, length=cfg.data.forecast_horizon
+    )
 
     logger.info(f"Loaded dataset")
     logger.debug(f"  Input sequence: {input_sequence['data'].shape}")
-    logger.debug(f"  Target sequence: {target_sequence['data'].shape}")
+    logger.debug(f"  Target sequence (assimilation): {target_sequence['data'].shape}")
+    logger.debug(f"  Ground truth sequence (full forecast): {ground_truth_sequence['data'].shape}")
     # -------------------------------------------------------------------------
     # 2. Apply Observation Operators
     # -------------------------------------------------------------------------
@@ -254,6 +261,13 @@ def main(cfg: DictConfig):
     target_data = np.nan_to_num(target_data, nan=0.0)
     target_tensor = (
         torch.from_numpy(target_data[:, 0:5, :, :].copy()).float().unsqueeze(0).to(device)
+    )
+     
+    # Convert full ground truth for RMSE diagnostics
+    ground_truth_data = ground_truth_sequence["data"].values
+    ground_truth_data = np.nan_to_num(ground_truth_data, nan=0.0)
+    ground_truth_tensor = (
+        torch.from_numpy(ground_truth_data[:, 0:5, :, :].copy()).float().unsqueeze(0).to(device)
     )
 
     logger.info("Prepared tensors")
@@ -326,6 +340,7 @@ def main(cfg: DictConfig):
         log_frequency=cfg.logging.log_frequency,
         histogram_frequency=cfg.logging.histogram_frequency,
         scheduled_pooling=scheduled_pooling,
+        forecast_horizon=cfg.data.forecast_horizon,
     )
     logger.info("Initialized optimizer")
 
@@ -340,6 +355,9 @@ def main(cfg: DictConfig):
         ocean_mask=ocean_mask,
         exp_id=exp_id,
         regional_masks=None,
+        input_sequence_xr=input_sequence,
+        target_sequence_xr=target_sequence,
+        ground_truth_sequence_xr=ground_truth_sequence
     )
 
     logger.info("\n" + "=" * 60)

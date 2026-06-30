@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 from .loss import ObservationLoss
 from .gradient import GradientFilter, ScheduledPooling
 from .metrics import MetricsComputer
+from .output_handler import OutputHandler
+import xarray as xr
 
 
 class ICOptimizer:
@@ -68,6 +70,7 @@ class ICOptimizer:
         log_frequency: int = 1,
         histogram_frequency: int = 50,
         scheduled_pooling: Optional[ScheduledPooling] = None,
+        forecast_horizon: int = 28,
     ):
         """
         Initialize IC optimizer.
@@ -88,6 +91,7 @@ class ICOptimizer:
             log_frequency: Log metrics every N iterations
             histogram_frequency: Log histograms/embeddings every N iterations
             scheduled_pooling: Optional scheduled pooling object for multigrid optimization
+            forecast_horizon: Number of forecast steps for diagnostics (default: 28)
         """
         self.forward_model = forward_model
         self.loss_fn = loss_fn
@@ -104,6 +108,7 @@ class ICOptimizer:
         self.log_frequency = log_frequency
         self.histogram_frequency = histogram_frequency
         self.scheduled_pooling = scheduled_pooling
+        self.forecast_horizon = forecast_horizon
 
         # Tracking variables
         self.history = []
@@ -111,9 +116,15 @@ class ICOptimizer:
         self.best_iteration = 0
         self.best_x0 = None
         self.best_predictions = None
+          
+        # Store xarray datasets for NetCDF output (set during optimize())
+        self.input_sequence_xr = None
+        self.target_sequence_xr = None
+        self.ground_truth_sequence_xr = None
 
-        # Writer initialized later after exp_id is set
+        # Writer and output handler initialized later after exp_id is set
         self.writer = None
+        self.output_handler = None
 
     def setup_directories(self, exp_id: str):
         """
@@ -144,6 +155,9 @@ class ICOptimizer:
 
         # Initialize TensorBoard writer for this experiment
         self.writer = SummaryWriter(log_dir=str(self.tensorboard_dir))
+        
+        # Initialize output handler for NetCDF diagnostics
+        self.output_handler = OutputHandler(exp_dir=self.exp_dir, device=self.device)
 
         logger.info(f"Output directory: {self.exp_dir}")
         logger.info(f"TensorBoard logs: {self.tensorboard_dir}")
@@ -156,16 +170,22 @@ class ICOptimizer:
         ocean_mask: torch.Tensor,
         exp_id: str,
         regional_masks: Optional[Dict[str, np.ndarray]] = None,
+        input_sequence_xr: Optional[xr.Dataset] = None,
+        target_sequence_xr: Optional[xr.Dataset] = None,
+        ground_truth_sequence_xr: Optional[xr.Dataset] = None,
     ) -> Tuple[torch.Tensor, Dict]:
         """
         Run optimization loop.
 
         Args:
             x0_init: Initial condition [B, T=2, C, H, W]
-            target_sequence: Target observations [B, T_obs, C, H, W]
+            target_sequence: Target observations [B, T_obs, C, H, W] (assimilation window only)
             ocean_mask: Ocean mask [C, H, W]
             exp_id: Experiment identifier for output directory
             regional_masks: Regional masks for basin-stratified metrics (optional)
+            input_sequence_xr: xarray Dataset with input sequence (for NetCDF output)
+            target_sequence_xr: xarray Dataset with target sequence (assimilation window, for coordinates)
+            ground_truth_sequence_xr: xarray Dataset with full ground truth (T=forecast_horizon, for RMSE diagnostics)
 
         Returns:
             best_x0: Optimized initial condition [B, T=2, C, H, W]
@@ -173,12 +193,26 @@ class ICOptimizer:
         """
         # Setup directories for this experiment
         self.setup_directories(exp_id)
+          
+        # Store xarray datasets for NetCDF output
+        self.input_sequence_xr = input_sequence_xr
+        self.target_sequence_xr = target_sequence_xr
+        self.ground_truth_sequence_xr = ground_truth_sequence_xr
+         
+        # Convert ground truth xarray to tensor for RMSE diagnostics
+        self.ground_truth_tensor = None
+        if ground_truth_sequence_xr is not None:
+            ground_truth_data = ground_truth_sequence_xr["data"].values
+            ground_truth_data = np.nan_to_num(ground_truth_data, nan=0.0)
+            self.ground_truth_tensor = (
+                torch.from_numpy(ground_truth_data[:, 0:5, :, :].copy()).float().to(x0_init.device)
+            )
 
         # Initialize optimization variables
         x0_current = x0_init.clone().detach().requires_grad_(True)
         x0_reference = x0_init.clone().detach()  # Reference IC (never updated)
 
-        # Number of forward steps to roll out
+        # Number of forward steps to roll out (for assimilation window)
         num_forecast_steps = target_sequence.shape[1]
 
         logger.info(f"\n{'='*60}")
@@ -334,7 +368,7 @@ class ICOptimizer:
             "final_loss": self.history[-1]["loss"],
         }
 
-        self._save_final_results(results)
+        self._save_final_results(results, x0_init, target_sequence, self.ground_truth_tensor, ocean_mask)
 
         # Close TensorBoard writer
         self.writer.close()
@@ -465,12 +499,23 @@ class ICOptimizer:
 
         logger.info(f"Saved checkpoint: {checkpoint_path}")
 
-    def _save_final_results(self, results: Dict):
+    def _save_final_results(
+        self,
+        results: Dict,
+        x0_init: torch.Tensor,
+        target_sequence: torch.Tensor,
+        ground_truth_sequence: torch.Tensor,
+        ocean_mask: torch.Tensor
+    ):
         """
         Save final optimization results to experiment directory.
 
         Args:
             results: Results dictionary
+            x0_init: Initial condition [B, T=2, C, H, W]
+            target_sequence: Target observations [B, T_obs, C, H, W] (assimilation window)
+            ground_truth_sequence: Full ground truth [B, T=forecast_horizon, C, H, W]
+            ocean_mask: Ocean mask [C, H, W]
         """
         # Save history as JSON to metrics/
         history_path = self.metrics_dir / "optimization_history.json"
@@ -479,12 +524,22 @@ class ICOptimizer:
 
         logger.info(f"Saved history: {history_path}")
 
-        # Save best IC and predictions to exp root
+        # Compute full forecasts for diagnostics (T=forecast_horizon)
+        logger.info(f"Computing full forecast ({self.forecast_horizon} steps) for diagnostics...")
+        with torch.no_grad():
+            _, reference_forecast = self.forward_model.forward(x0_init, self.forecast_horizon)
+            _, full_forecast = self.forward_model.forward(self.best_x0, self.forecast_horizon)
+        logger.info(f"Reference forecast shape: {reference_forecast.shape}")
+        logger.info(f"Optimized forecast shape: {full_forecast.shape}")
+
+        # Save best IC and predictions to exp root (legacy .pt format)
         best_path = self.exp_dir / "best_solution.pt"
         torch.save(
             {
                 "x0": self.best_x0.cpu(),
-                "predictions": self.best_predictions.cpu(),
+                "predictions": self.best_predictions.cpu(),  # Assimilation window predictions (T=7)
+                "reference_forecast": reference_forecast.cpu(),
+                "full_forecast": full_forecast.cpu(),  # Full forecast (T=forecast_horizon)
                 "iteration": self.best_iteration,
                 "loss": self.best_loss,
             },
@@ -492,3 +547,26 @@ class ICOptimizer:
         )
 
         logger.info(f"Saved best solution: {best_path}")
+         
+        # Save state NetCDF + visualization diagnostics (if xarray datasets are provided)
+        if self.input_sequence_xr is not None and self.target_sequence_xr is not None:
+            try:
+                self.output_handler.save_outputs(
+                    x0_init=x0_init,
+                    x0_optimized=self.best_x0,
+                    reference_forecast=reference_forecast,
+                    full_forecast=full_forecast,  # Full forecast (T=forecast_horizon) for state/plots
+                    target_sequence=target_sequence,  # Assimilation window (T=7)
+                    ground_truth_sequence=ground_truth_sequence,  # Full ground truth for RMSE evolution
+                    input_sequence=self.input_sequence_xr,
+                    target_sequence_xr=self.target_sequence_xr,
+                    ground_truth_sequence_xr=self.ground_truth_sequence_xr,
+                    ocean_mask=ocean_mask,
+                    best_iteration=self.best_iteration,
+                    best_loss=self.best_loss
+                )
+            except Exception as e:
+                logger.error(f"Failed to save outputs: {e}", exc_info=True)
+                logger.warning("Continuing without NetCDF outputs...")
+        else:
+            logger.warning("Skipping NetCDF diagnostics (xarray datasets not provided)")

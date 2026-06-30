@@ -11,6 +11,7 @@ Modules:
     optimizer: Main optimization loop with TensorBoard logging
     metrics: RMSE (global + basin-stratified) and PSD metrics
     utils: Helper functions for masks, normalizers, forward pass
+    output_handler: state NetCDF + diagnostic visualization outputs
 """
 
 __version__ = "0.1.0"
@@ -18,18 +19,21 @@ __version__ = "0.1.0"
 # Explicit imports for clean API
 from .data import GlonetDataset, ObservationOperator
 from .loss import ObservationLoss
-from .gradient import GradientFilter
+from .gradient import GradientFilter, ScheduledPooling
 from .optimizer import ICOptimizer
 from .metrics import MetricsComputer
 from .utils import MaskBuilder, ForwardModel
+from .output_handler import OutputHandler
 
 __all__ = [
     "GlonetDataset",
     "ObservationOperator", 
     "ObservationLoss",
     "GradientFilter",
+    "ScheduledPooling",
     "ICOptimizer",
     "MetricsComputer",
     "MaskBuilder",
     "ForwardModel",
+    "OutputHandler",
 ]

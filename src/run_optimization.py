@@ -86,7 +86,7 @@ def main(cfg: DictConfig):
         start_idx=cfg.data.sample_idx,
         length=cfg.data.sequence_length
     )
-    
+     
     # Extract target sequence (observations for optimization)
     target_start_idx = cfg.data.sample_idx + cfg.data.sequence_length
     target_end_idx = target_start_idx + cfg.data.observation_length
@@ -94,35 +94,43 @@ def main(cfg: DictConfig):
         start_idx=target_start_idx,
         length=cfg.data.observation_length
     )
-    
+     
+    # Load full ground truth for RMSE diagnostics (T=0 to T=forecast_horizon)
+    ground_truth_end_idx = target_start_idx + cfg.data.forecast_horizon
+    ground_truth_sequence = dataset.get_sequence(
+        start_idx=target_start_idx,
+        length=cfg.data.forecast_horizon
+    )
+     
     logger.info(f"Loaded dataset")
     logger.debug(f"  Input sequence: {input_sequence['data'].shape}")
-    logger.debug(f"  Target sequence: {target_sequence['data'].shape}")
-    
+    logger.debug(f"  Target sequence (assimilation): {target_sequence['data'].shape}")
+    logger.debug(f"  Ground truth sequence (full forecast): {ground_truth_sequence['data'].shape}")
+     
     # -------------------------------------------------------------------------
     # 2. Apply Observation Operators
     # -------------------------------------------------------------------------
     logger.info("Applying observation operators...")
     obs_operator = ObservationOperator(device=device)
-    
+     
     # SSH observations
     ssh_mask = None
     if cfg.observations.mode != 'full':
         ssh_obs = dataset.get_ssh_obs(target_start_idx, cfg.data.observation_length)
         mdt = None  # Load MDT if obs_mode='real'
-        
+         
         target_sequence, ssh_mask = obs_operator.apply_ssh_operator(
             target_sequence,
             ssh_obs,
             cfg.observations.mode,
             mdt=mdt
         )
-    
+     
     # SST observations
     sst_mask = None
     if cfg.observations.mode != 'full':
         sst_obs = dataset.get_sst_obs(target_start_idx, cfg.data.observation_length)
-        
+         
         target_sequence, sst_mask = obs_operator.apply_sst_operator(
             target_sequence,
             sst_obs,
@@ -163,15 +171,21 @@ def main(cfg: DictConfig):
     input_data = input_sequence['data'].values
     input_data = np.nan_to_num(input_data, nan=0.0)
     x0_init = torch.from_numpy(input_data[:, 0:5, :, :].copy()).float().unsqueeze(0).to(device)
-    
+     
     # Target (observations): [B, T_obs, C, H, W]
     target_data = target_sequence['data'].values
     target_data = np.nan_to_num(target_data, nan=0.0)
     target_tensor = torch.from_numpy(target_data[:, 0:5, :, :].copy()).float().unsqueeze(0).to(device)
-    
+     
+    # Convert full ground truth for RMSE diagnostics
+    ground_truth_data = ground_truth_sequence['data'].values
+    ground_truth_data = np.nan_to_num(ground_truth_data, nan=0.0)
+    ground_truth_tensor = torch.from_numpy(ground_truth_data[:, 0:5, :, :].copy()).float().unsqueeze(0).to(device)
+     
     logger.info(f"Prepared tensors")
     logger.debug(f"  Initial condition: {x0_init.shape}")
     logger.debug(f"  Target observations: {target_tensor.shape}")
+    logger.debug(f"  Ground truth (full forecast): {ground_truth_tensor.shape}")
     
     # -------------------------------------------------------------------------
     # 5. Initialize Forward Model
@@ -248,7 +262,7 @@ def main(cfg: DictConfig):
     # 9. Initialize Optimizer
     # -------------------------------------------------------------------------
     logger.info("Initializing optimizer...")
-    
+     
     optimizer = ICOptimizer(
         forward_model=forward_model,
         loss_fn=loss_fn,
@@ -264,9 +278,10 @@ def main(cfg: DictConfig):
         save_frequency=cfg.logging.save_frequency,
         log_frequency=cfg.logging.log_frequency,
         histogram_frequency=cfg.logging.histogram_frequency,
-        scheduled_pooling=scheduled_pooling
+        scheduled_pooling=scheduled_pooling,
+        forecast_horizon=cfg.data.forecast_horizon,
     )
-    
+     
     logger.info("Initialized optimizer")
     logger.debug(f"  Learning rate: {cfg.optimization.learning_rate}")
     logger.debug(f"  Num iterations: {cfg.optimization.num_iterations}")
@@ -281,7 +296,10 @@ def main(cfg: DictConfig):
         target_sequence=target_tensor,
         ocean_mask=ocean_mask,
         exp_id=exp_id,
-        regional_masks=regional_masks
+        regional_masks=regional_masks,
+        input_sequence_xr=input_sequence,
+        target_sequence_xr=target_sequence,
+        ground_truth_sequence_xr=ground_truth_sequence
     )
     
     logger.info("\n" + "="*60)

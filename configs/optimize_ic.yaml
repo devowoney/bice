@@ -45,7 +45,7 @@ data:
   sample_idx: 0  # Starting time index
   sequence_length: 2  # IC sequence length (glonet requires T=2)
   observation_length: 7  # Number of observation time steps
-  forecast_horizon: 21  # Total forecast horizon (for extended analysis)
+  forecast_horizon: 28  # Total forecast horizon (7-day assimilation + 3-week forecast)
 
 # Model configuration
 model:
