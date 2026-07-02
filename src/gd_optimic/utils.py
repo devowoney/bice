@@ -7,43 +7,47 @@ Provides:
     - Normalizers: Load normalization/denormalization functions
 """
 
+import logging
+import sys
+from pathlib import Path
+from typing import Dict, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-from pathlib import Path
-from typing import Tuple, Dict
-import sys
-import logging
+import xarray as xr
+import xesmf as xe
 
 logger = logging.getLogger(__name__)
 
 # Import glonet utilities (assumes they are in sys.path or installed)
 # Note: These imports match the reference notebook's structure
 base = Path(__file__).resolve().parent
-lib_dir = (base / '..' / '..' / 'model' / 'glonet').resolve()
+lib_dir = (base / ".." / ".." / "model" / "glonet").resolve()
 sys.path.insert(0, str(lib_dir))
 from utility import get_normalizer1, get_denormalizer1
 from modelp2 import Glonet
+from .data import GlonetDataset
 
 
 class MaskBuilder:
     """
     Build ocean/land masks and observation masks from dataset.
-    
+
     Masks are used to:
     - Zero out gradients on land pixels (ocean_mask)
     - Apply observation operators only where data exists (obs_mask)
     """
-    
+
     def __init__(self, device: str = "cuda"):
         """
         Initialize mask builder.
-        
+
         Args:
             device: PyTorch device ('cuda' or 'cpu')
         """
         self.device = device
-        
+
     def build_ocean_mask(self, sample_data: np.ndarray) -> torch.Tensor:
         """
         Create ocean mask from sample data.
@@ -74,7 +78,9 @@ class MaskBuilder:
                 land_mask = np.isnan(sample_arr[:5, :, :]).astype(np.float32)
                 ocean_mask = 1.0 - land_mask
             else:
-                raise ValueError(f"Unexpected channel count in sample_data: {C}. Expected at least 5 channels.")
+                raise ValueError(
+                    f"Unexpected channel count in sample_data: {C}. Expected at least 5 channels."
+                )
         else:
             raise ValueError(f"Unsupported sample_data shape: {sample_arr.shape}")
 
@@ -82,18 +88,18 @@ class MaskBuilder:
         ocean_mask_tensor = torch.from_numpy(ocean_mask.copy()).float().to(self.device)
 
         return ocean_mask_tensor
-    
+
     def build_obs_mask(
         self,
         ocean_mask: torch.Tensor,
         obs_length: int,
         ssh_nanmask: np.ndarray = None,
         sst_nanmask: np.ndarray = None,
-        obs_mode: str = "full"
+        obs_mode: str = "full",
     ) -> torch.Tensor:
         """
         Create observation mask indicating where observations are available.
-        
+
         Args:
             ocean_mask: torch.Tensor [C, H, W] - base ocean mask
             obs_length: int - number of time steps in observation window
@@ -103,7 +109,7 @@ class MaskBuilder:
                 - 'full': all ocean pixels observed (idealized twin/ceiling check)
                 - 'simulated': realistic observation coverage with GLORYS12 truth (OSSE)
                 - 'real': real satellite observations (OSE)
-        
+
         Returns:
             obs_mask: torch.Tensor [T, C, H, W] - observation mask
                       1 where observations available, 0 elsewhere
@@ -122,68 +128,139 @@ class MaskBuilder:
         # Start with ocean mask repeated over time
         # Shape: [T, C=5, H, W]
         obs_mask = base_ocean_mask.unsqueeze(0).repeat(obs_length, 1, 1, 1).clone()
-        
+
         if obs_mode == "full":
             # All ocean pixels are observed for all variables
             # No modification needed - obs_mask already equals ocean_mask repeated
             pass
-        
+
         elif obs_mode in ["simulated", "real"]:
             # Apply realistic observation coverage
             # Channel 0: SSH - along-track altimetry (sparse)
             # Channel 1: SST - gridded satellite (dense but with gaps)
             # Channels 2-4: SSS, U, V - not directly observed (set to 0)
-            
+
             if ssh_nanmask is not None:
                 # SSH observation mask: 1 where observed, 0 where not
-                ssh_mask_torch = torch.from_numpy(
-                    np.nan_to_num(ssh_nanmask, nan=0.0)
-                ).float().to(self.device)
+                ssh_mask_torch = (
+                    torch.from_numpy(np.nan_to_num(ssh_nanmask, nan=0.0)).float().to(self.device)
+                )
                 obs_mask[:, 0, :, :] = ssh_mask_torch
             else:
                 # If no SSH mask provided, set SSH to not observed
                 obs_mask[:, 0, :, :] = 0.0
-            
+
             if sst_nanmask is not None:
                 # SST observation mask: 1 where observed, 0 where not
-                sst_mask_torch = torch.from_numpy(
-                    np.nan_to_num(sst_nanmask, nan=0.0)
-                ).float().to(self.device)
+                sst_mask_torch = (
+                    torch.from_numpy(np.nan_to_num(sst_nanmask, nan=0.0)).float().to(self.device)
+                )
                 obs_mask[:, 1, :, :] = sst_mask_torch
             else:
                 # If no SST mask provided, set SST to not observed
                 obs_mask[:, 1, :, :] = 0.0
-            
+
             # SSS, U, V are not directly observed in satellite data
             obs_mask[:, 2:5, :, :] = 0.0
-        
+
         else:
-            raise ValueError(f"Unknown obs_mode: {obs_mode}. Must be 'full', 'simulated', or 'real'")
-        
+            raise ValueError(
+                f"Unknown obs_mode: {obs_mode}. Must be 'full', 'simulated', or 'real'"
+            )
+
         return obs_mask
+
+    def build_regional_masks(
+        self,
+        lat: np.ndarray,
+        lon: np.ndarray,
+        ocean_mask: torch.Tensor,
+        variance_ssh_path: str,
+        high_var_threshold: float,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Build the notebook-style regional masks used for diagnostics.
+
+        The reference workflow uses:
+        - global: all ocean points
+        - gulf_stream: a geographic box over the North Atlantic
+        - high_var: SSH variance above a threshold
+        - low_var: ocean points not in high_var
+
+        The variance field is interpolated to the target grid before masking.
+        """
+        lat_1d = np.asarray(lat, dtype=np.float32)
+        lon_1d = np.asarray(lon, dtype=np.float32)
+        lon_grid, lat_grid = np.meshgrid(lon_1d, lat_1d)
+        lon_grid = np.where(lon_grid > 180.0, lon_grid - 360.0, lon_grid)
+
+        if ocean_mask.dim() == 3:
+            ocean = ocean_mask[:5].detach().cpu().numpy() > 0
+        else:
+            ocean = ocean_mask.unsqueeze(0).repeat(5, 1, 1).detach().cpu().numpy() > 0
+
+        variance_ds = xr.open_dataset(variance_ssh_path)
+        sla_var_np = variance_ds["sla"].values
+        target_grid = xr.Dataset(
+            {
+                "lat": (["y", "x"], lat_grid),
+                "lon": (["y", "x"], lon_grid),
+            }
+        )
+
+        # Create regridder from source ds grid to target grid
+        regridder = xe.Regridder(variance_ds, target_grid, method="bilinear", periodic=False)
+
+        # Apply regridding to the sla variable
+        variance_map = regridder(sla_var_np)
+
+        # Normalize longitudes to the notebook convention [-180, 180].
+        gs_lat_min, gs_lat_max = 25.0, 45.0
+        gs_lon_min, gs_lon_max = -100.0, -50.0
+        gulf_stream_box = (
+            (lat_grid >= gs_lat_min)
+            & (lat_grid <= gs_lat_max)
+            & (lon_grid >= gs_lon_min)
+            & (lon_grid <= gs_lon_max)
+        )
+
+        high_var = (variance_map >= high_var_threshold) & ocean[0]
+        low_var = (~high_var) & ocean[0]
+
+        regional_masks = {
+            "global": ocean.astype(np.float32),
+            "gulf_stream": np.repeat(gulf_stream_box[None, :, :], 5, axis=0).astype(np.float32)
+            * ocean.astype(np.float32),
+            "high_var": np.repeat(high_var[None, :, :], 5, axis=0).astype(np.float32)
+            * ocean.astype(np.float32),
+            "low_var": np.repeat(low_var[None, :, :], 5, axis=0).astype(np.float32)
+            * ocean.astype(np.float32),
+        }
+
+        return regional_masks
 
 
 class ForwardModel:
     """
     Wrapper for multi-step forward rollout using glonet with gradient checkpointing.
-    
+
     This class encapsulates:
     - Model loading and device placement
     - Normalization/denormalization
     - Multi-step autoregressive rollout
     - Gradient checkpointing for memory efficiency
     """
-    
+
     def __init__(
         self,
         model_path: str,
         normalizer_path: str,
         device: str = "cuda",
-        use_gradient_checkpointing: bool = True
+        use_gradient_checkpointing: bool = True,
     ):
         """
         Initialize forward model.
-        
+
         Args:
             model_path: Path to model checkpoint (.pth file)
             normalizer_path: Path to normalizer statistics
@@ -192,36 +269,36 @@ class ForwardModel:
         """
         self.device = device
         self.use_gradient_checkpointing = use_gradient_checkpointing
-        
+
         # Load normalizers
         self.normalizer = get_normalizer1(normalizer_path)
         self.denormalizer = get_denormalizer1(normalizer_path)
-        
+
         # Load model
         self.model = self._load_model(model_path)
         self.model.eval()  # Set to eval mode (frozen model, no dropout/batchnorm randomness)
-        
+
         # Freeze all model parameters (frozen-model invariant A1)
         for param in self.model.parameters():
             param.requires_grad = False
-    
+
     def _load_model(self, checkpoint_path: str) -> nn.Module:
         """
         Load model from checkpoint.
-        
+
         Args:
             checkpoint_path: Path to checkpoint file
-            
+
         Returns:
             model: Loaded PyTorch model
         """
         # Import the gradient checkpointing wrapper from model directory
         sys.path.insert(0, str(Path(__file__).parent.parent.parent / "model" / "glonet"))
         from optimIC_GD_glonetLit import GlonetGradientCheckpointing
-        
+
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
+
         # Create model with gradient checkpointing if enabled
         if self.use_gradient_checkpointing:
             model = GlonetGradientCheckpointing(shape_in=(2, 5, 672, 1440))
@@ -229,93 +306,84 @@ class ForwardModel:
             # Fallback: try importing Glonet directly
             try:
                 from modelp2 import Glonet
+
                 model = Glonet(shape_in=(2, 5, 672, 1440))
             except ImportError:
                 logger.warning("Falling back to GlonetGradientCheckpointing (Glonet import failed)")
                 model = GlonetGradientCheckpointing(shape_in=(2, 5, 672, 1440))
-        
+
         # Load weights
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint["model_state_dict"])
         model = model.to(self.device)
-        
+
         return model
-    
-    def forward(
-        self,
-        x0: torch.Tensor,
-        num_steps: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    def forward(self, x0: torch.Tensor, num_steps: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Multi-step forward rollout with autoregressive prediction.
-        
+
         Model output [B, T=2, C, H, W] goes directly back as input for next step.
         Only the last timestep [:, -1, :, :, :] is extracted for the accumulated predictions.
-        
+
         Args:
             x0: Initial condition [B, T=2, C, H, W]
             num_steps: Number of forecast steps to generate
-            
+
         Returns:
             x0_normalized: Normalized initial condition [B, T=2, C, H, W]
             y_hat_steps: Stacked predictions [B, num_steps, C, H, W] (denormalized, from last timestep)
         """
         # Normalize initial condition
         x0_normalized = self.normalizer(x0)
-        
+
         # First forward pass
         if self.use_gradient_checkpointing:
             y_hat = torch.utils.checkpoint.checkpoint(
-                self.model,
-                x0_normalized,
-                use_reentrant=False
+                self.model, x0_normalized, use_reentrant=False
             )
         else:
             y_hat = self.model(x0_normalized)
-        
+
         # y_hat is [B, T=2, C, H, W], extract last timestep and denormalize
         y_hat_steps = [self.denormalizer(y_hat[:, -1, :, :, :])]
-        
+
         # Autoregressive forecasting for remaining steps
         for step_idx in range(num_steps - 1):
             # Feed model output directly back as input for next step
             if self.use_gradient_checkpointing:
-                y_hat = torch.utils.checkpoint.checkpoint(
-                    self.model,
-                    y_hat,
-                    use_reentrant=False
-                )
+                y_hat = torch.utils.checkpoint.checkpoint(self.model, y_hat, use_reentrant=False)
             else:
                 y_hat = self.model(y_hat)
-            
+
             # Extract last timestep and denormalize
             y_hat_steps.append(self.denormalizer(y_hat[:, -1, :, :, :]))
-        
+
         # Stack all predictions: [B, num_steps, C, H, W]
         y_hat_steps = torch.stack(y_hat_steps, dim=1)
-        
+
         return x0_normalized, y_hat_steps
 
 
 class NormalizerLoader:
     """
     Load and manage normalization/denormalization functions.
-    
+
     This is a lightweight wrapper around the existing utility functions.
     """
-    
+
     @staticmethod
     def load_normalizers(model_location: str) -> Tuple:
         """
         Load normalizer and denormalizer functions.
-        
+
         Args:
             model_location: Path to directory containing normalization statistics
-            
+
         Returns:
             normalizer: Function to normalize data
             denormalizer: Function to denormalize data
         """
         normalizer = get_normalizer1(model_location)
         denormalizer = get_denormalizer1(model_location)
-        
+
         return normalizer, denormalizer

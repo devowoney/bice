@@ -205,6 +205,11 @@ def main(cfg: DictConfig):
         start_idx=target_start_idx, length=cfg.data.forecast_horizon
     )
 
+    # Align all loaded sequences to the same grid before applying observation operators.
+    input_sequence = dataset.align_grid(input_sequence, input_sequence)
+    target_sequence = dataset.align_grid(target_sequence, input_sequence)
+    ground_truth_sequence = dataset.align_grid(ground_truth_sequence, input_sequence)
+
     logger.info(f"Loaded dataset")
     logger.debug(f"  Input sequence: {input_sequence['data'].shape}")
     logger.debug(f"  Target sequence (assimilation): {target_sequence['data'].shape}")
@@ -238,6 +243,13 @@ def main(cfg: DictConfig):
 
     sample_data = dataset.dataset.isel(time=cfg.data.sample_idx)["data"].values
     ocean_mask = mask_builder.build_ocean_mask(sample_data)
+    regional_masks = mask_builder.build_regional_masks(
+        input_sequence.coords["lat"].values,
+        input_sequence.coords["lon"].values,
+        ocean_mask,
+        variance_ssh_path=cfg.data.variance_ssh_path,
+        high_var_threshold=cfg.metrics.high_var_threshold,
+    )
 
     obs_mask = mask_builder.build_obs_mask(
         ocean_mask,
@@ -354,7 +366,7 @@ def main(cfg: DictConfig):
         target_sequence=target_tensor,
         ocean_mask=ocean_mask,
         exp_id=exp_id,
-        regional_masks=None,
+        regional_masks=regional_masks,
         input_sequence_xr=input_sequence,
         target_sequence_xr=target_sequence,
         ground_truth_sequence_xr=ground_truth_sequence

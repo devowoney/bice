@@ -21,6 +21,7 @@ tmp*
 sb_*
 .tmp/*
 !.tmp/runs/
+!.tmp/research/
 model/glonet3/
 
 # AI agent

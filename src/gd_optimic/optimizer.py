@@ -198,6 +198,7 @@ class ICOptimizer:
         self.input_sequence_xr = input_sequence_xr
         self.target_sequence_xr = target_sequence_xr
         self.ground_truth_sequence_xr = ground_truth_sequence_xr
+        self.regional_masks = regional_masks
          
         # Convert ground truth xarray to tensor for RMSE diagnostics
         self.ground_truth_tensor = None
@@ -269,14 +270,16 @@ class ICOptimizer:
             with torch.no_grad():
                 # Ensure ocean_mask matches channel dimension of gradients
                 if ocean_mask.dim() == 3 and ocean_mask.shape[0] != filtered_gradients.shape[2]:
+                    mask_ch = int(ocean_mask.shape[0])
+                    grad_ch = int(filtered_gradients.shape[2])
                     logger.warning(
-                        f"Ocean mask channels ({ocean_mask.shape[0]}) != gradients channels ({filtered_gradients.shape[2]}). Adjusting mask."
+                        "Ocean mask channels (%d) != gradients channels (%d). Adjusting mask.", mask_ch, grad_ch
                     )
-                    if ocean_mask.shape[0] >= filtered_gradients.shape[2]:
-                        ocean_mask = ocean_mask[: filtered_gradients.shape[2], :, :]
+                    if mask_ch >= grad_ch:
+                        ocean_mask = ocean_mask[:grad_ch, :, :]
                     else:
                         raise ValueError(
-                            f"Ocean mask has fewer channels ({ocean_mask.shape[0]}) than gradients ({filtered_gradients.shape[2]})."
+                            f"Ocean mask has fewer channels ({mask_ch}) than gradients ({grad_ch})."
                         )
 
                 masked_gradients = filtered_gradients * ocean_mask.unsqueeze(0).unsqueeze(0)
@@ -368,7 +371,14 @@ class ICOptimizer:
             "final_loss": self.history[-1]["loss"],
         }
 
-        self._save_final_results(results, x0_init, target_sequence, self.ground_truth_tensor, ocean_mask)
+        self._save_final_results(
+            results,
+            x0_init,
+            target_sequence,
+            self.ground_truth_tensor,
+            ocean_mask,
+            regional_masks,
+        )
 
         # Close TensorBoard writer
         self.writer.close()
@@ -505,7 +515,8 @@ class ICOptimizer:
         x0_init: torch.Tensor,
         target_sequence: torch.Tensor,
         ground_truth_sequence: torch.Tensor,
-        ocean_mask: torch.Tensor
+        ocean_mask: torch.Tensor,
+        regional_masks: Optional[Dict[str, np.ndarray]] = None,
     ):
         """
         Save final optimization results to experiment directory.
@@ -561,6 +572,7 @@ class ICOptimizer:
                     input_sequence=self.input_sequence_xr,
                     target_sequence_xr=self.target_sequence_xr,
                     ground_truth_sequence_xr=self.ground_truth_sequence_xr,
+                    regional_masks=regional_masks,
                     ocean_mask=ocean_mask,
                     best_iteration=self.best_iteration,
                     best_loss=self.best_loss

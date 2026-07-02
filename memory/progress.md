@@ -183,3 +183,11 @@
 - **CS1 Compliance:** Human-readable, extensively commented, simple structure
 - **Scientific Integrity:** Enforces A1 (frozen model), A2 (obs/eval separation), A5 (reproducibility)
 - **Status:** R10(j) complete ✅ | **Phase B research 10/10 complete** → ready for Phase P (Professor)
+
+## 2026-07-01 — Short-line edits (code hygiene)
+
+- Edited small blocks in core modules to comply with CS1 and `ruler = 132`:
+  - `src/gd_optimic/output_handler.py`: wrapped long imshow() calls and attributes dictionaries across multiple lines to improve readability.
+  - `src/gd_optimic/optimizer.py`: shortened logger messages and used temporary vars for clarity when adjusting ocean masks.
+- Validation: `python -m py_compile` succeeded for modified files.
+- Status: Applied in-tree.

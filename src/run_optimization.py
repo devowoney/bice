@@ -101,6 +101,11 @@ def main(cfg: DictConfig):
         start_idx=target_start_idx,
         length=cfg.data.forecast_horizon
     )
+
+    # Align all loaded sequences to the same grid before applying observation operators.
+    input_sequence = dataset.align_grid(input_sequence, input_sequence)
+    target_sequence = dataset.align_grid(target_sequence, input_sequence)
+    ground_truth_sequence = dataset.align_grid(ground_truth_sequence, input_sequence)
      
     logger.info(f"Loaded dataset")
     logger.debug(f"  Input sequence: {input_sequence['data'].shape}")
@@ -148,6 +153,13 @@ def main(cfg: DictConfig):
     # Sample data for ocean mask
     sample_data = dataset.dataset.isel(time=cfg.data.sample_idx)['data'].values
     ocean_mask = mask_builder.build_ocean_mask(sample_data)
+    regional_masks = mask_builder.build_regional_masks(
+        input_sequence.coords["lat"].values,
+        input_sequence.coords["lon"].values,
+        ocean_mask,
+        variance_ssh_path=cfg.data.variance_ssh_path,
+        high_var_threshold=cfg.metrics.high_var_threshold,
+    )
     
     # Observation mask
     obs_mask = mask_builder.build_obs_mask(
@@ -246,15 +258,6 @@ def main(cfg: DictConfig):
         ocean_mask=ocean_mask,
         device=device
     )
-    
-    # Regional masks (for basin-stratified RMSE)
-    regional_masks = None
-    if cfg.metrics.compute_rmse_basin:
-        # Build regional masks
-        # This would require implementing regional mask building logic
-        # For now, set to None (can be added in Phase P)
-        regional_masks = None
-        logger.debug("  Note: Regional masks deferred to Phase P")
     
     logger.info(f"Initialized metrics computer")
     

@@ -371,8 +371,15 @@ class PSDComputer:
         Returns:
             band_energy_ratio: Ratio of mesoscale energy to total energy
         """
+        # Tiny local trapezoidal integrator to avoid np.trapz compatibility issues
+        def _trapz(y: np.ndarray, x: np.ndarray) -> float:
+            if x.size < 2 or y.size < 2:
+                return 0.0
+            dx = x[1:] - x[:-1]
+            return float(np.sum(dx * (y[1:] + y[:-1]) / 2.0))
+
         # Total energy: integral of PSD over all wavenumbers
-        total_energy = np.trapz(psd_radial, k_radial)
+        total_energy = _trapz(psd_radial, k_radial)
         
         # Mesoscale energy: integral of PSD over mesoscale band
         k_min, k_max = mesoscale_band
@@ -381,7 +388,7 @@ class PSDComputer:
         if not np.any(in_band):
             return 0.0
         
-        mesoscale_energy = np.trapz(psd_radial[in_band], k_radial[in_band])
+        mesoscale_energy = _trapz(psd_radial[in_band], k_radial[in_band])
         
         # Band-energy ratio
         band_ratio = mesoscale_energy / (total_energy + 1e-10)
