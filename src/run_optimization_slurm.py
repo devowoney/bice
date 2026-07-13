@@ -36,9 +36,8 @@ from gd_optimic import (
     MetricsComputer,
     MaskBuilder,
     ForwardModel,
+    ScheduledPooling,
 )
-from gd_optimic.gradient import ScheduledPooling
-
 
 def setup_slurm_environment(cfg: DictConfig) -> DictConfig:
     """
@@ -292,6 +291,7 @@ def main(cfg: DictConfig):
         normalizer_path=cfg.model.location,
         device=device,
         use_gradient_checkpointing=cfg.model.use_gradient_checkpointing,
+        ocean_mask=ocean_mask,
     )
     logger.info("Initialized forward model")
 

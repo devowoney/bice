@@ -257,6 +257,7 @@ class ForwardModel:
         normalizer_path: str,
         device: str = "cuda",
         use_gradient_checkpointing: bool = True,
+        ocean_mask: torch.Tensor = None,
     ):
         """
         Initialize forward model.
@@ -266,9 +267,11 @@ class ForwardModel:
             normalizer_path: Path to normalizer statistics
             device: PyTorch device ('cuda' or 'cpu')
             use_gradient_checkpointing: Whether to use gradient checkpointing for memory efficiency
+            ocean_mask: Ocean mask [C, H, W] to apply after normalization (optional, for notebook compatibility)
         """
         self.device = device
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.ocean_mask = ocean_mask
 
         # Load normalizers
         self.normalizer = get_normalizer1(normalizer_path)
@@ -336,6 +339,10 @@ class ForwardModel:
         # Normalize initial condition
         x0_normalized = self.normalizer(x0)
 
+        # Apply ocean mask after normalization (notebook-compatible masking)
+        if self.ocean_mask is not None:
+            x0_normalized = x0_normalized * self.ocean_mask.unsqueeze(0).unsqueeze(0)
+
         # First forward pass
         if self.use_gradient_checkpointing:
             y_hat = torch.utils.checkpoint.checkpoint(
@@ -345,10 +352,16 @@ class ForwardModel:
             y_hat = self.model(x0_normalized)
 
         # y_hat is [B, T=2, C, H, W], extract last timestep and denormalize
-        y_hat_steps = [self.denormalizer(y_hat[:, -1, :, :, :])]
+        y_hat_last = y_hat[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
+
+        y_hat_denorm = self.denormalizer(y_hat_last) * self.ocean_mask.unsqueeze(0)
+
+        y_hat_steps = [y_hat_denorm]
+        y_hat = torch.stack([x0_normalized[:, -1, :, :, :], y_hat_last], dim=1)
 
         # Autoregressive forecasting for remaining steps
         for step_idx in range(num_steps - 1):
+            y_hat_first = y_hat[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
             # Feed model output directly back as input for next step
             if self.use_gradient_checkpointing:
                 y_hat = torch.utils.checkpoint.checkpoint(self.model, y_hat, use_reentrant=False)
@@ -356,7 +369,10 @@ class ForwardModel:
                 y_hat = self.model(y_hat)
 
             # Extract last timestep and denormalize
-            y_hat_steps.append(self.denormalizer(y_hat[:, -1, :, :, :]))
+            y_hat_last = y_hat[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
+            y_hat_denorm = self.denormalizer(y_hat_last) * self.ocean_mask.unsqueeze(0)
+            y_hat_steps.append(y_hat_denorm)
+            y_hat = torch.stack([y_hat_first, y_hat_last], dim=1)
 
         # Stack all predictions: [B, num_steps, C, H, W]
         y_hat_steps = torch.stack(y_hat_steps, dim=1)

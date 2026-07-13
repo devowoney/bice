@@ -207,7 +207,8 @@ def main(cfg: DictConfig):
         model_path=str(Path(cfg.model.location) / cfg.model.checkpoint_files.part1),
         normalizer_path=cfg.model.location,
         device=device,
-        use_gradient_checkpointing=cfg.model.use_gradient_checkpointing
+        use_gradient_checkpointing=cfg.model.use_gradient_checkpointing,
+        ocean_mask=ocean_mask.to(device) if ocean_mask is not None else None
     )
     
     logger.info(f"Initialized forward model (gradient checkpointing: {cfg.model.use_gradient_checkpointing})")
