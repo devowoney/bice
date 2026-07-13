@@ -6,28 +6,27 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     # Core ML/Scientific
-    "torch>=2.0.0",
     "numpy>=1.24.0",
     "xarray>=2023.1.0",
     "scipy>=1.10.0",
-    
     # Data handling
     "xesmf>=0.8.0",
     "pandas>=2.0.0",
     "netCDF4>=1.6.0",
     "dask>=2023.1.0",
-    
     # Configuration & experiment tracking
     "hydra-core>=1.3.0",
     "omegaconf>=2.3.0",
     "tensorboard>=2.12.0",
-    
     # Visualization & utilities
     "matplotlib>=3.7.0",
     "tqdm>=4.65.0",
-    
     # SLURM integration
     "submitit>=1.5.0",
+    "ipykernel>=7.3.0",
+    # torch
+    "torch==2.12.1",
+    "torchvision==0.27.1",
 ]
 
 [project.optional-dependencies]
@@ -46,3 +45,16 @@ target-version = ["py310", "py311"]
 [tool.isort]
 profile = "black"
 line_length = 100
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

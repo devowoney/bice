@@ -85,7 +85,7 @@ optimization:
   num_iterations: 300
   
   # Gradient filtering
-  gradient_filter: "pooling"  # Options: 'none', 'weight', 'delta', 'pooling', 'pooling+weight'
+  gradient_filter: "none"  # Options: 'none', 'weight', 'delta', 'pooling', 'pooling+weight'
   
   # Scheduled pooling (multigrid optimization)
   use_scheduled_pooling: false

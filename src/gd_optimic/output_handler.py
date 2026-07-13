@@ -120,24 +120,21 @@ class OutputHandler:
 
             # Save diagnostics as visualization files (no NetCDF)
             self._save_ic_correction_figure(x0_init, x0_optimized, input_sequence)
-            rmse_data = self._save_rmse_figure(
-                x0_init=x0_init,
-                x0_optimized=x0_optimized,
-                reference_forecast=reference_forecast,
-                optimized_forecast=full_forecast,
-                ground_truth_sequence=ground_truth_sequence,
-                ocean_mask=ocean_mask,
-                observation_length=int(target_sequence.shape[1]),
+
+            # Determine RMSE horizon from available forecasts/ground-truth (no separate global rmse figure)
+            rmse_horizon = int(
+                min(
+                    int(reference_forecast.shape[1]),
+                    int(full_forecast.shape[1]),
+                    int(ground_truth_sequence.shape[1]),
+                )
             )
-            self._save_psd_figure(
-                reference_forecast=reference_forecast,
-                optimized_forecast=full_forecast,
-                ground_truth_sequence=ground_truth_sequence,
-                ocean_mask=ocean_mask,
-            )
+
             regional_summary = {}
             if regional_masks is not None:
                 regional_summary = self._save_regional_diagnostics(
+                    x0_init=x0_init,
+                    x0_optimized=x0_optimized,
                     reference_forecast=reference_forecast,
                     optimized_forecast=full_forecast,
                     ground_truth_sequence=ground_truth_sequence,
@@ -153,6 +150,14 @@ class OutputHandler:
                     input_sequence=input_sequence,
                     gulf_stream_mask=regional_masks["gulf_stream"],
                 )
+            else:
+                # Keep the global PSD plot as a fallback when no regional masks are available.
+                self._save_psd_figure(
+                    reference_forecast=reference_forecast,
+                    optimized_forecast=full_forecast,
+                    ground_truth_sequence=ground_truth_sequence,
+                    ocean_mask=ocean_mask,
+                )
 
             summary_path = self.diagnostics_dir / "diagnostic_summary.json"
             with open(summary_path, "w") as f:
@@ -160,17 +165,16 @@ class OutputHandler:
                     {
                         "best_iteration": best_iteration,
                         "best_loss": float(best_loss),
-                        "rmse_horizon": int(rmse_data["horizon"]),
+                        "rmse_horizon": rmse_horizon,
                         "files": {
                             "ic_correction_plot": "diagnostics/ic_correction_comparison.png",
-                            "rmse_plot": "diagnostics/rmse_evolution.png",
-                            "psd_plot": "diagnostics/psd_comparison.png",
                             "regional_rmse_plot": "diagnostics/rmse_region_*.png",
                             "regional_psd_plot": "diagnostics/psd_region_*.png",
                             "regional_metrics_json": "diagnostics/regional_metrics.json",
                             "forecast_animation": "states/forecast_comparison.gif",
                             "gulf_stream_animation": "states/gulf_stream_forecast_comparison.gif",
                         },
+                        "psd_plot": None if regional_masks is not None else "diagnostics/psd_comparison.png",
                         "regional_metrics": regional_summary,
                     },
                     f,
@@ -320,12 +324,19 @@ class OutputHandler:
             extent, origin = self._get_extent_origin(input_sequence)
             im_ref = axes[ch_idx, 0].imshow(
                 ref[0, ch_idx], cmap="viridis", vmin=-vmax, vmax=vmax, animated=True,
-                extent=extent, origin=origin, aspect='auto'
+                extent=extent, origin=origin, aspect='auto', interpolation="none"
             )
             im_opt = axes[ch_idx, 1].imshow(
                 opt[0, ch_idx], cmap="viridis", vmin=-vmax, vmax=vmax, animated=True,
-                extent=extent, origin=origin, aspect='auto'
+                extent=extent, origin=origin, aspect='auto', interpolation="none"
             )
+            # Add colorbars for reference and optimized panels so animation color scale is visible
+            try:
+                fig.colorbar(im_ref, ax=axes[ch_idx, 0], fraction=0.046, pad=0.02)
+                fig.colorbar(im_opt, ax=axes[ch_idx, 1], fraction=0.046, pad=0.02)
+            except Exception:
+                # Fallback: ignore colorbar errors (rare in headless environments)
+                pass
             images.append((im_ref, im_opt))
 
             axes[ch_idx, 0].set_ylabel(f"{var_name}\n{long_name}", fontsize=9)
@@ -397,6 +408,7 @@ class OutputHandler:
                 extent=extent,
                 origin=origin,
                 aspect="auto",
+                interpolation="none",
             )
             im1 = axes[ch_idx, 1].imshow(
                 opt_field,
@@ -406,6 +418,7 @@ class OutputHandler:
                 extent=extent,
                 origin=origin,
                 aspect="auto",
+                interpolation="none",
             )
             im2 = axes[ch_idx, 2].imshow(
                 delta_field,
@@ -415,6 +428,7 @@ class OutputHandler:
                 extent=extent,
                 origin=origin,
                 aspect="auto",
+                interpolation="none",
             )
 
             axes[ch_idx, 0].set_ylabel(f"{var_name}\n{long_name}", fontsize=9)
@@ -584,6 +598,8 @@ class OutputHandler:
 
     def _save_regional_diagnostics(
         self,
+        x0_init: torch.Tensor,
+        x0_optimized: torch.Tensor,
         reference_forecast: torch.Tensor,
         optimized_forecast: torch.Tensor,
         ground_truth_sequence: torch.Tensor,
@@ -600,6 +616,9 @@ class OutputHandler:
         ref = reference_forecast.squeeze(0).detach().cpu().numpy()
         opt = optimized_forecast.squeeze(0).detach().cpu().numpy()
         gt = ground_truth_sequence.squeeze(0).detach().cpu().numpy()
+        # Convert initial conditions to numpy to compute initial RMSE consistently with global plot
+        x0_ref = x0_init.squeeze(0).detach().cpu().numpy()  # [T=2, C, H, W]
+        x0_opt = x0_optimized.squeeze(0).detach().cpu().numpy()  # [T=2, C, H, W]
         regions = ["global", "gulf_stream", "high_var", "low_var"]
         var_names = [self.VAR_METADATA[c][0] for c in range(ref.shape[1])]
         lat = input_sequence.coords["lat"].values
@@ -611,13 +630,23 @@ class OutputHandler:
             mask = regional_masks[region_name] > 0
             return mask
 
-        def _rmse_series(arr: np.ndarray, truth: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        def _rmse_series(arr: np.ndarray, truth: np.ndarray, mask: np.ndarray, init_arr: np.ndarray = None) -> np.ndarray:
+            """Compute RMSE series including initial condition at index 0.
+
+            If init_arr is provided, its last timestep (init_arr[-1]) is used as the
+            initial state to compute the RMSE at t=0 — matching the global RMSE plot.
+            Otherwise falls back to using arr[0] as before.
+            """
             horizon = min(arr.shape[0], truth.shape[0])
             series = np.full((horizon + 1, arr.shape[1]), np.nan, dtype=np.float64)
             for c_idx in range(arr.shape[1]):
                 valid = mask[c_idx]
                 if np.any(valid):
-                    init_err = arr[0, c_idx] - truth[0, c_idx]
+                    if init_arr is not None:
+                        init_field = init_arr[-1, c_idx]
+                    else:
+                        init_field = arr[0, c_idx]
+                    init_err = init_field - truth[0, c_idx]
                     series[0, c_idx] = float(np.sqrt(np.nanmean(init_err[valid] ** 2)))
             for t in range(horizon):
                 for c_idx in range(arr.shape[1]):
@@ -709,8 +738,8 @@ class OutputHandler:
             return float(mesoscale_energy / (total_energy + 1e-10))
 
         def _save_rmse_plot(region_name: str, mask: np.ndarray) -> Dict[str, Dict[str, float]]:
-            ref_series = _rmse_series(ref, gt, mask)
-            opt_series = _rmse_series(opt, gt, mask)
+            ref_series = _rmse_series(ref, gt, mask, init_arr=x0_ref)
+            opt_series = _rmse_series(opt, gt, mask, init_arr=x0_opt)
             horizon = ref_series.shape[0] - 1
             step_axis = np.arange(horizon + 1)
             fig, axes = plt.subplots(5, 1, figsize=(12, 18), sharex=True)
@@ -843,6 +872,7 @@ class OutputHandler:
                 extent=extent,
                 origin=origin,
                 aspect="auto",
+                interpolation="none",
                 animated=True,
             )
             im_opt = axes[ch_idx, 1].imshow(
@@ -853,8 +883,15 @@ class OutputHandler:
                 extent=extent,
                 origin=origin,
                 aspect="auto",
+                interpolation="none",
                 animated=True,
             )
+            # Add colorbars for gulf stream cropped panels
+            try:
+                fig.colorbar(im_ref, ax=axes[ch_idx, 0], fraction=0.046, pad=0.02)
+                fig.colorbar(im_opt, ax=axes[ch_idx, 1], fraction=0.046, pad=0.02)
+            except Exception:
+                pass
             images.append((im_ref, im_opt))
             axes[ch_idx, 0].set_ylabel(f"{var_name}\n{long_name}", fontsize=9)
             axes[ch_idx, 0].set_xticks([])

@@ -142,7 +142,7 @@ class GlonetDataset:
         return combined
 
     @classmethod
-    def align_grid(self, source_ds, target_ds):
+    def align_grid(cls, source_ds, target_ds):
         """
         Align source dataset/dataarray to target dataset grid using xESMF regridding.
 
