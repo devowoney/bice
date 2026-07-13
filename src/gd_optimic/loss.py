@@ -69,11 +69,11 @@ class ObservationLoss:
             mse_per_step: MSE for each timestep and channel [B, T, C]
         """
         # Compute element-wise MSE: [B, T, C, H, W]
-        mse_raw = self.mse_fn(predictions, targets)
+        se_raw = self.mse_fn(predictions, targets)
         
         # Apply observation mask: only compute loss where observations exist
         # obs_mask is [T, C, H, W], broadcast to [B, T, C, H, W]
-        mse_masked = mse_raw * self.obs_mask.unsqueeze(0)
+        se_masked = se_raw * self.obs_mask.unsqueeze(0)
         
         # Count valid observation points per channel
         # obs_mask_sum: [T, C] - number of valid obs pixels per channel per timestep
@@ -82,7 +82,7 @@ class ObservationLoss:
         # Normalize by number of valid observations
         # This gives mean MSE over observed pixels only
         # mse_per_step: [B, T, C]
-        mse_per_step = mse_masked.sum(dim=(-2, -1)) / (obs_mask_sum.unsqueeze(0) + 1e-10)
+        mse_per_step = se_masked.sum(dim=(-2, -1)) / (obs_mask_sum.unsqueeze(0) + 1e-10)
         
         return mse_per_step
     
@@ -110,22 +110,31 @@ class ObservationLoss:
         # Compute per-step MSE: [B, T, C]
         mse_per_step = self.compute_mse_per_step(predictions, targets)
         
-        # Compute target variance per channel (for normalization)
-        # Apply obs mask to only consider observed pixels
-        targets_masked = targets * self.obs_mask.unsqueeze(0)
-        
-        # Variance per channel: [C]
-        # We compute variance over all valid observations (B, T, H, W dims)
-        obs_mask_expanded = self.obs_mask.unsqueeze(0).expand_as(targets)
-        valid_count = obs_mask_expanded.sum(dim=(0, 1, 3, 4))  # Count per channel
-        
-        # Mean per channel
-        target_mean = targets_masked.sum(dim=(0, 1, 3, 4)) / (valid_count + 1e-10)
-        
-        # Variance per channel: E[(x - mean)^2]
-        targets_centered = (targets - target_mean.view(1, 1, -1, 1, 1)) * self.obs_mask.unsqueeze(0)
-        target_var = (targets_centered ** 2).sum(dim=(0, 1, 3, 4)) / (valid_count + 1e-10)
-        
+        # Compute (or reuse cached) target variance per channel for normalization.
+        # The target variance depends only on the targets and obs_mask — cache it to avoid
+        # recomputing every optimization iteration which saves time.
+        if not hasattr(self, "_cached_target_var") or self._cached_target_var is None:
+            # Apply obs mask to only consider observed pixels
+            targets_masked = targets * self.obs_mask.unsqueeze(0)
+            
+            # Variance per channel: [C]
+            # We compute variance over all valid observations (B, T, H, W dims)
+            obs_mask_expanded = self.obs_mask.unsqueeze(0).expand_as(targets)
+            valid_count = obs_mask_expanded.sum(dim=(0, 1, 3, 4))  # Count per channel
+            
+            # Mean per channel
+            target_mean = targets_masked.sum(dim=(0, 1, 3, 4)) / (valid_count + 1e-10)
+            
+            # Variance per channel: E[(x - mean)^2]
+            targets_centered = (targets - target_mean.view(1, 1, -1, 1, 1)) * self.obs_mask.unsqueeze(0)
+            target_var = (targets_centered ** 2).sum(dim=(0, 1, 3, 4)) / (valid_count + 1e-10)
+            # target_var = torch.tensor(1, device=self.device) 
+            # Cache on CPU to avoid holding GPU memory
+            self._cached_target_var = target_var.detach().cpu()
+        else:
+            # Move cached variance to the device of mse_per_step for computation
+            target_var = self._cached_target_var.to(mse_per_step.device)
+
         # Normalize MSE by target variance: [B, T, C]
         nmse_per_step = mse_per_step / (target_var.unsqueeze(0).unsqueeze(0) + 1e-10)
         
