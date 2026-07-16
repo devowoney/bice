@@ -213,6 +213,11 @@ class ICOptimizer:
         x0_current = x0_init.clone().detach().requires_grad_(True)
         x0_reference = x0_init.clone().detach()  # Reference IC (never updated)
 
+        # Store ocean_mask on self for logging and other uses
+        self._ocean_mask = ocean_mask.to(self.device) if ocean_mask is not None else None
+        # Placeholder for last applied IC update (learning_rate * masked_gradients)
+        self._last_ic_update = None
+
         # Number of forward steps to roll out (for assimilation window)
         num_forecast_steps = target_sequence.shape[1]
 
@@ -284,8 +289,13 @@ class ICOptimizer:
 
                 masked_gradients = filtered_gradients * ocean_mask.unsqueeze(0).unsqueeze(0)
 
+                # Compute update to apply (store for logging)
+                ic_update = self.learning_rate * masked_gradients
+                # Save last update on CPU for TensorBoard logging
+                self._last_ic_update = ic_update.detach().cpu().clone()
+
                 # Gradient descent update
-                x0_current = x0_current - self.learning_rate * masked_gradients
+                x0_current = x0_current - ic_update
 
                 # Ensure x0_current requires grad for next iteration
                 x0_current = x0_current.detach().requires_grad_(True)
@@ -331,7 +341,15 @@ class ICOptimizer:
 
             # Logging to TensorBoard
             if (iteration + 1) % self.log_frequency == 0:
-                self._log_to_tensorboard(iteration + 1, loss_details, metrics, current_kernel)
+                # Pass current and reference IC to TensorBoard logger so cumulative correction (from zero) can be visualized
+                self._log_to_tensorboard(
+                    iteration + 1,
+                    loss_details,
+                    metrics,
+                    current_kernel,
+                    x0_current=x0_current,
+                    x0_reference=x0_reference,
+                )
 
             # Log histograms/embeddings less frequently
             if (iteration + 1) % self.histogram_frequency == 0:
@@ -386,8 +404,15 @@ class ICOptimizer:
         return self.best_x0, results
 
     def _log_to_tensorboard(
-        self, iteration: int, loss_details: Dict, metrics: Dict, kernel_size: int
+        self,
+        iteration: int,
+        loss_details: Dict,
+        metrics: Dict,
+        kernel_size: int,
+        x0_current: Optional[torch.Tensor] = None,
+        x0_reference: Optional[torch.Tensor] = None,
     ):
+
         """
         Log metrics to TensorBoard.
 
@@ -422,6 +447,113 @@ class ICOptimizer:
 
         # Pooling kernel size
         self.writer.add_scalar("state/pooling_kernel", kernel_size, iteration)
+
+        # IC correction/update visualization (per-step, coordinate-aware)
+        # _last_ic_update: [B, T, C, H, W] on CPU
+        if self._last_ic_update is not None and self._ocean_mask is not None:
+            import numpy as _np
+
+            var_names = ["SSH", "T", "S", "U", "V"]
+            units_map = {"SSH": "m", "T": "°C", "S": "psu", "U": "m/s", "V": "m/s"}
+
+            # Last applied IC update: [C, H, W]
+            last_update = self._last_ic_update[0, -1]
+            masked_update_all = last_update * self._ocean_mask.detach().cpu()
+
+            if masked_update_all.numel() > 0:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+
+                try:
+                    extent = None
+                    origin = "lower"
+                    if (
+                        self.input_sequence_xr is not None
+                        and "lat" in self.input_sequence_xr.coords
+                        and "lon" in self.input_sequence_xr.coords
+                    ):
+                        lat = self.input_sequence_xr.coords["lat"].values
+                        lon = self.input_sequence_xr.coords["lon"].values
+                        extent = (float(_np.min(lon)), float(_np.max(lon)), float(_np.min(lat)), float(_np.max(lat)))
+                        origin = "lower" if float(lat[0]) < float(lat[-1]) else "upper"
+
+                    fig, axes = plt.subplots(5, 1, figsize=(11, 18), dpi=100, constrained_layout=True)
+                    if not isinstance(axes, _np.ndarray):
+                        axes = _np.array([axes])
+
+                    fig.suptitle("IC update by step (north up, lon/lat coordinates)", fontsize=13)
+
+                    for ch_idx, ax in enumerate(axes):
+                        arr = masked_update_all[ch_idx].detach().cpu().numpy()
+                        var_name = var_names[ch_idx] if ch_idx < len(var_names) else f"ch{ch_idx}"
+                        ch_abs = float(_np.nanmax(_np.abs(arr))) if arr.size > 0 else 1.0
+                        if not _np.isfinite(ch_abs) or ch_abs == 0.0:
+                            ch_abs = 1.0
+
+                        im = ax.imshow(
+                            arr,
+                            cmap="seismic",
+                            vmin=-ch_abs,
+                            vmax=ch_abs,
+                            interpolation="nearest",
+                            origin=origin,
+                            aspect="auto",
+                            extent=extent,
+                        )
+                        ax.set_title(f"{var_name} update ({units_map.get(var_name, '')})", fontsize=10)
+                        ax.set_xlabel("lon")
+                        ax.set_ylabel("lat")
+                        ax.tick_params(labelsize=8)
+                        # ax.text(
+                        #     0.02,
+                        #     0.98,
+                        #     "N ↑    E →",
+                        #     transform=ax.transAxes,
+                        #     color="white",
+                        #     fontsize=8,
+                        #     ha="left",
+                        #     va="top",
+                        #     bbox=dict(facecolor="black", alpha=0.6, pad=2, edgecolor="none"),
+                        # )
+                        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+
+                    legend_text = (
+                        "IC update = learning_rate × filtered_gradient × ocean_mask\n"
+                        "Color shows the per-step correction in physical units."
+                    )
+                    fig.text(
+                        0.01,
+                        0.005,
+                        legend_text,
+                        fontsize=8,
+                        color="black",
+                        bbox=dict(facecolor="white", alpha=0.75, pad=3, edgecolor="none"),
+                    )
+
+                    fig.canvas.draw()
+                    img_buf = _np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+                    self.writer.add_image("state/ic/update_image", img_buf, iteration, dataformats="HWC")
+                except Exception:
+                    # Fallback: normalized raster if plotting fails.
+                    update_np = masked_update_all.detach().cpu().numpy()
+                    for ch_idx, var_name in enumerate(var_names):
+                        ch_arr = update_np[ch_idx]
+                        ch_abs = float(_np.nanmax(_np.abs(ch_arr)))
+                        if not _np.isfinite(ch_abs) or ch_abs == 0.0:
+                            ch_abs = 1.0
+                        norm_ch = ((ch_arr / (2.0 * ch_abs)) + 0.5).clip(0.0, 1.0)
+                        self.writer.add_image(
+                            f"state/ic/update_image/{var_name}",
+                            norm_ch[None, :, :],
+                            iteration,
+                            dataformats="CHW",
+                        )
+                finally:
+                    try:
+                        plt.close("all")
+                    except Exception:
+                        pass
 
     def _log_histograms_to_tensorboard(
         self,

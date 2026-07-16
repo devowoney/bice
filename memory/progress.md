@@ -191,3 +191,8 @@
   - `src/gd_optimic/optimizer.py`: shortened logger messages and used temporary vars for clarity when adjusting ocean masks.
 - Validation: `python -m py_compile` succeeded for modified files.
 - Status: Applied in-tree.
+
+## 2026-07-16 — TensorBoard IC-update fix
+- Fixed TensorBoard IC-update rendering in `src/gd_optimic/optimizer.py`: use `fig.canvas.buffer_rgba()` for matplotlib capture, and log per-channel fallback images separately under `state/ic/update_image/{var}`.
+- This resolved the `FigureCanvasAgg.tostring_rgb()` crash and the fallback `TypeError` from trying to log a 5-channel tensor as one image.
+- Kept the north-up lat/lon visualization and the single figure legend/colorbar for the main path.
