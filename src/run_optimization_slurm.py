@@ -219,13 +219,31 @@ def main(cfg: DictConfig):
     logger.info("Applying observation operators...")
     obs_operator = ObservationOperator(device=device)
 
+    # Load stats file (MDT/climatology or SSH stats) if provided in config
+    stats_field = None
+    if cfg.data.get('stats_file', None):
+        try:
+            import xarray as _xr
+            from pathlib import Path as _Path
+            stats_ds = _xr.open_dataset(_Path(cfg.data.stats_file))
+            # Prefer variable named 'data' else use first data variable
+            if 'data' in stats_ds.data_vars:
+                stats_field = stats_ds['data']
+            else:
+                first_var = list(stats_ds.data_vars)[0]
+                stats_field = stats_ds[first_var]
+            logger.info(f"Loaded stats file from: {cfg.data.stats_file}")
+        except Exception as e:
+            logger.warning(f"Failed to load stats file {cfg.data.stats_file}: {e}")
+            stats_field = None
+
     ssh_mask = None
     sst_mask = None
 
     if cfg.observations.mode != "full":
         ssh_obs = dataset.get_ssh_obs(target_start_idx, cfg.data.observation_length)
         target_sequence, ssh_mask = obs_operator.apply_ssh_operator(
-            target_sequence, ssh_obs, cfg.observations.mode
+            target_sequence, ssh_obs, cfg.observations.mode, mdt=stats_field
         )
 
         sst_obs = dataset.get_sst_obs(target_start_idx, cfg.data.observation_length)
@@ -291,7 +309,7 @@ def main(cfg: DictConfig):
         normalizer_path=cfg.model.location,
         device=device,
         use_gradient_checkpointing=cfg.model.use_gradient_checkpointing,
-        ocean_mask=ocean_mask,
+        ocean_mask=ocean_mask.to(device) if ocean_mask is not None else None,
     )
     logger.info("Initialized forward model")
 
@@ -328,7 +346,19 @@ def main(cfg: DictConfig):
     # 8. Initialize Metrics Computer
     # -------------------------------------------------------------------------
     logger.info("Initializing metrics computer...")
-    metrics_computer = MetricsComputer(ocean_mask=ocean_mask, device=device)
+
+    metrics_computer = MetricsComputer(
+        ocean_mask=ocean_mask,
+        device=device,
+        stats_field=stats_field
+    )
+
+    # Provide input/ground-truth sequences so metrics_computer can compute time-mean if stats not provided
+    metrics_computer.set_mean_from_sequences(
+        input_sequence_xr=input_sequence,
+        ground_truth_sequence_xr=ground_truth_sequence,
+    )
+
     logger.info("Initialized metrics computer")
     # -------------------------------------------------------------------------
     # 9. Initialize Optimizer

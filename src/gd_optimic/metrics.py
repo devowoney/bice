@@ -34,17 +34,83 @@ class MetricsComputer:
     def __init__(
         self,
         ocean_mask: torch.Tensor,
-        device: str = "cuda"
+        device: str = "cuda",
+        stats_field: object = None,
     ):
         """
         Initialize metrics computer.
-        
+
         Args:
             ocean_mask: Ocean mask [C, H, W] - 1=ocean, 0=land
             device: PyTorch device ('cuda' or 'cpu')
+            stats_field: Optional mean field per channel [C, H, W].
+            Examples: MDT/climatology or SSH stats. If provided, diagnostics use
+            anomaly = field - stats_field.
         """
         self.ocean_mask = ocean_mask
         self.device = device
+        # Mean field used to compute anomalies for diagnostics. If None, will be computed from input data when available.
+        # Stored as torch.Tensor on same device with shape [C, H, W]
+        self.mean_field = None
+        if stats_field is not None:
+            # Accept numpy/xarray/torch array; convert to torch.Tensor
+            import numpy as _np
+            import torch as _torch
+            if isinstance(stats_field, _torch.Tensor):
+                self.mean_field = stats_field.to(self.device).float()
+            elif hasattr(stats_field, 'values'):
+                # xarray DataArray: handle possible time/channel dimensions robustly
+                arr = _np.nan_to_num(stats_field.values, nan=0.0)
+                # If stats has time dimension (time, ch, lat, lon), average over time
+                if arr.ndim == 4:
+                    arr = arr.mean(axis=0)  # now [ch, lat, lon]
+
+                # Determine expected spatial shape from ocean_mask if available
+                C_expected = self.ocean_mask.shape[0] if self.ocean_mask is not None else None
+                H_expected = self.ocean_mask.shape[1] if self.ocean_mask is not None else None
+                W_expected = self.ocean_mask.shape[2] if self.ocean_mask is not None else None
+
+                # If arr is [ch, H, W] and matches channels, accept directly
+                if arr.ndim == 3 and C_expected is not None and arr.shape[1:] == (H_expected, W_expected):
+                    ch_dim = arr.shape[0]
+                    if ch_dim == C_expected:
+                        mean_arr = arr
+                    else:
+                        # If stats only contains fewer channels (e.g., SSH only), broadcast into C_expected
+                        mean_arr = _np.zeros((C_expected, H_expected, W_expected), dtype=arr.dtype)
+                        n_fill = min(ch_dim, C_expected)
+                        mean_arr[:n_fill, :, :] = arr[:n_fill, :, :]
+                elif (
+                    arr.ndim == 2
+                    and (H_expected is not None and W_expected is not None)
+                    and arr.shape == (H_expected, W_expected)
+                ):
+                    # Stats provided only SSH spatial field (lat, lon) -> place into SSH channel (0)
+                    mean_arr = _np.zeros((C_expected, H_expected, W_expected), dtype=arr.dtype)
+                    mean_arr[0, :, :] = arr
+                else:
+                    # Fallback: try to coerce to (C, H, W) if possible
+                    if arr.ndim == 3:
+                        # If arr shape matches (H, W, C) transpose
+                        if (
+                            C_expected is not None
+                            and arr.shape[-1] == C_expected
+                            and arr.shape[0] == H_expected
+                            and arr.shape[1] == W_expected
+                        ):
+                            mean_arr = arr.transpose(2, 0, 1)
+                        else:
+                            # Unknown layout - attempt to reshape if sizes match
+                            try:
+                                mean_arr = arr.reshape((C_expected, H_expected, W_expected))
+                            except Exception:
+                                raise ValueError(f"Unsupported stats_field shape: {arr.shape}")
+                    else:
+                        raise ValueError(f"Unsupported stats_field shape: {arr.shape}")
+
+                self.mean_field = _torch.from_numpy(_np.nan_to_num(mean_arr, nan=0.0)).float().to(self.device)
+            else:
+                self.mean_field = _torch.from_numpy(_np.nan_to_num(_np.array(stats_field), nan=0.0)).float().to(self.device)
     
     def compute_rmse_per_channel(
         self,
@@ -52,31 +118,42 @@ class MetricsComputer:
         targets: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute RMSE per channel (global average over ocean pixels).
-        
+        Compute RMSE per channel (global average over ocean pixels) on anomaly fields.
+
+        If a mean_field is set (per-channel spatial mean [C, H, W]), diagnostics are computed
+        on anomalies: field - mean_field. Otherwise, diagnostics use the raw fields.
+
         Args:
             predictions: Model predictions [B, C, H, W]
             targets: Target truth [B, C, H, W]
-            
+
         Returns:
             rmse_per_channel: RMSE for each channel [B, C]
         """
-        # Compute squared error
-        squared_error = (predictions - targets) ** 2
-        
+        # If mean field is available, compute anomalies
+        if self.mean_field is not None:
+            preds = predictions - self.mean_field.unsqueeze(0)
+            targs = targets - self.mean_field.unsqueeze(0)
+        else:
+            preds = predictions
+            targs = targets
+
+        # Compute squared error on anomaly or full fields
+        squared_error = (preds - targs) ** 2
+
         # Apply ocean mask: only compute RMSE over ocean pixels
         # ocean_mask: [C, H, W], broadcast to [B, C, H, W]
         masked_error = squared_error * self.ocean_mask.unsqueeze(0)
-        
+
         # Count valid ocean pixels per channel
         ocean_count = self.ocean_mask.sum(dim=(-2, -1))  # [C]
-        
+
         # Mean squared error per channel
         mse_per_channel = masked_error.sum(dim=(-2, -1)) / (ocean_count.unsqueeze(0) + 1e-10)
-        
+
         # Root mean squared error
         rmse_per_channel = torch.sqrt(mse_per_channel)
-        
+
         return rmse_per_channel
     
     def compute_rmse_global(
@@ -185,27 +262,32 @@ class MetricsComputer:
         x0_reference: torch.Tensor
     ) -> Dict[str, float]:
         """
-        Compute RMSE between current IC and reference IC.
-        
+        Compute RMSE between current IC and reference IC on anomaly fields if mean_field is set.
+
         Tracks how much the initial condition has changed during optimization.
-        
+
         Args:
             x0_current: Current IC [B, T, C, H, W]
             x0_reference: Reference IC [B, T, C, H, W]
-            
+
         Returns:
             ic_rmse_dict: Dictionary with per-variable IC RMSE
         """
         # Use last timestep: [B, C, H, W]
         x0_current_last = x0_current[:, -1, :, :, :]
         x0_reference_last = x0_reference[:, -1, :, :, :]
-        
+
+        # If mean_field is available, subtract it to compute anomalies
+        if self.mean_field is not None:
+            x0_current_last = x0_current_last - self.mean_field.unsqueeze(0)
+            x0_reference_last = x0_reference_last - self.mean_field.unsqueeze(0)
+
         # Compute RMSE per channel
         rmse_per_channel = self.compute_rmse_per_channel(x0_current_last, x0_reference_last)
-        
+
         # Take mean over batch
         rmse_mean = rmse_per_channel.mean(dim=0)
-        
+
         # Store per-variable IC RMSE
         ic_rmse_dict = {
             'SSH': float(rmse_mean[0]),
@@ -214,9 +296,75 @@ class MetricsComputer:
             'U': float(rmse_mean[3]),
             'V': float(rmse_mean[4]),
         }
-        
+
         return ic_rmse_dict
     
+    def set_mean_from_sequences(
+        self,
+        input_sequence_xr=None,
+        ground_truth_sequence_xr=None,
+    ):
+        """
+        Set the mean_field used for anomaly diagnostics.
+
+        Priority:
+          1. If mean_field was provided at init (MDT), keep it.
+          2. If ground_truth_sequence_xr is provided, compute mean over time from it.
+          3. Else if input_sequence_xr is provided, compute mean over time from it.
+
+        Args:
+            input_sequence_xr: xarray Dataset with 'data' variable [time, ch, lat, lon]
+            ground_truth_sequence_xr: xarray Dataset with 'data' variable [time, ch, lat, lon]
+        """
+        if self.mean_field is not None:
+            # If mean_field already set (e.g., stats file), attempt to fill only missing channels from sequences.
+            try:
+                import torch as _torch
+                # Compute mean_over_time to use for filling
+                data = ds['data'].values  # [time, ch, lat, lon]
+                data = _np.nan_to_num(data, nan=0.0)
+                mean_over_time = data.mean(axis=0)  # [ch, lat, lon]
+                mean_over_time_t = _torch.from_numpy(mean_over_time).float().to(self.device)
+
+                # If shapes match, replace channels that are all-zero in existing mean_field
+                if self.mean_field.shape == mean_over_time_t.shape:
+                    for ch in range(self.mean_field.shape[0]):
+                        if _torch.allclose(self.mean_field[ch], _torch.zeros_like(self.mean_field[ch])):
+                            self.mean_field[ch] = mean_over_time_t[ch]
+                else:
+                    # If shapes differ, try to broadcast based on channel count
+                    C_existing = self.mean_field.shape[0]
+                    C_new = mean_over_time_t.shape[0]
+                    C_min = min(C_existing, C_new)
+                    for ch in range(C_min):
+                        if _torch.allclose(self.mean_field[ch], _torch.zeros_like(self.mean_field[ch])):
+                            self.mean_field[ch] = mean_over_time_t[ch]
+            except Exception:
+                # If any issue occurs, keep existing mean_field
+                return
+            return
+
+        import numpy as _np
+        import torch as _torch
+
+        ds = None
+        if ground_truth_sequence_xr is not None:
+            ds = ground_truth_sequence_xr
+        elif input_sequence_xr is not None:
+            ds = input_sequence_xr
+
+        if ds is None:
+            # No data available to compute mean; leave mean_field as None
+            return
+
+        # Extract data variable and compute mean over time axis
+        data = ds['data'].values  # [time, ch, lat, lon]
+        data = _np.nan_to_num(data, nan=0.0)
+        mean_over_time = data.mean(axis=0)  # [ch, lat, lon]
+
+        # Store as torch tensor on device
+        self.mean_field = _torch.from_numpy(mean_over_time).float().to(self.device)
+
     def compute_all_metrics(
         self,
         predictions: torch.Tensor,
@@ -227,31 +375,32 @@ class MetricsComputer:
     ) -> Dict:
         """
         Compute all metrics for a single optimization iteration.
-        
+
         Args:
             predictions: Model predictions [B, C, H, W]
             targets: Target truth [B, C, H, W]
             x0_current: Current IC [B, T, C, H, W]
             x0_reference: Reference IC [B, T, C, H, W]
             regional_masks: Regional masks (optional, for basin-stratified RMSE)
-            
+
         Returns:
             metrics_dict: Dictionary with all metrics
         """
         metrics_dict = {}
-        
+
+        # Ensure mean_field set if possible (caller should set earlier)
         # Global RMSE
         metrics_dict['rmse_global'] = self.compute_rmse_global(predictions, targets)
-        
+
         # Basin-stratified RMSE (if regional masks provided)
         if regional_masks is not None:
             metrics_dict['rmse_basin'] = self.compute_rmse_basin_stratified(
                 predictions, targets, regional_masks
             )
-        
+
         # IC RMSE
         metrics_dict['ic_rmse'] = self.compute_ic_rmse(x0_current, x0_reference)
-        
+
         return metrics_dict
 
 

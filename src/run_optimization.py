@@ -122,13 +122,13 @@ def main(cfg: DictConfig):
     ssh_mask = None
     if cfg.observations.mode != 'full':
         ssh_obs = dataset.get_ssh_obs(target_start_idx, cfg.data.observation_length)
-        mdt = None  # Load MDT if obs_mode='real'
+        stats_field = None  # Load stats file (MDT/climatology or SSH stats) if obs_mode='real'
          
         target_sequence, ssh_mask = obs_operator.apply_ssh_operator(
             target_sequence,
             ssh_obs,
             cfg.observations.mode,
-            mdt=mdt
+            mdt=stats_field
         )
      
     # SST observations
@@ -255,9 +255,36 @@ def main(cfg: DictConfig):
     # 8. Initialize Metrics Computer
     # -------------------------------------------------------------------------
     logger.info("Initializing metrics computer...")
+
+    # Load stats file (MDT/climatology or SSH stats) if provided in config
+    stats_field = None
+    if cfg.data.get('stats_file', None):
+        try:
+            import xarray as _xr
+            from pathlib import Path as _Path
+            stats_ds = _xr.open_dataset(_Path(cfg.data.stats_file))
+            # Prefer variable named 'data' else use first data variable
+            if 'data' in stats_ds.data_vars:
+                stats_field = stats_ds['data']
+            else:
+                # pick first data var
+                first_var = list(stats_ds.data_vars)[0]
+                stats_field = stats_ds[first_var]
+            logger.info(f"Loaded stats file from: {cfg.data.stats_file}")
+        except Exception as e:
+            logger.warning(f"Failed to load stats file {cfg.data.stats_file}: {e}")
+            stats_field = None
+
     metrics_computer = MetricsComputer(
         ocean_mask=ocean_mask,
-        device=device
+        device=device,
+        stats_field=stats_field
+    )
+
+    # Provide input/ground-truth sequences so metrics_computer can compute time-mean if stats not provided
+    metrics_computer.set_mean_from_sequences(
+        input_sequence_xr=input_sequence,
+        ground_truth_sequence_xr=ground_truth_sequence
     )
     
     logger.info(f"Initialized metrics computer")
