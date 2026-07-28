@@ -69,6 +69,7 @@ class OutputHandler:
         ocean_mask: torch.Tensor,
         best_iteration: int,
         best_loss: float,
+        mean_field: Optional[torch.Tensor] = None,
         regional_masks: Optional[Dict[str, np.ndarray]] = None,
     ):
         """
@@ -116,10 +117,16 @@ class OutputHandler:
                 reference_forecast=reference_forecast,
                 optimized_forecast=full_forecast,
                 input_sequence=input_sequence,
+                mean_field=mean_field,
             )
 
             # Save diagnostics as visualization files (no NetCDF)
-            self._save_ic_correction_figure(x0_init, x0_optimized, input_sequence)
+            self._save_ic_correction_figure(
+                x0_init=x0_init,
+                x0_optimized=x0_optimized,
+                input_sequence=input_sequence,
+                mean_field=mean_field,
+            )
 
             # Determine RMSE horizon from available forecasts/ground-truth (no separate global rmse figure)
             rmse_horizon = int(
@@ -168,10 +175,12 @@ class OutputHandler:
                         "rmse_horizon": rmse_horizon,
                         "files": {
                             "ic_correction_plot": "diagnostics/ic_correction_comparison.png",
+                            "ic_correction_anomaly_plot": "diagnostics/ic_correction_anomaly_comparison.png",
                             "regional_rmse_plot": "diagnostics/rmse_region_*.png",
                             "regional_psd_plot": "diagnostics/psd_region_*.png",
                             "regional_metrics_json": "diagnostics/regional_metrics.json",
                             "forecast_animation": "states/forecast_comparison.gif",
+                            "forecast_animation_anomaly": "states/forecast_comparison_anomaly.gif",
                             "gulf_stream_animation": "states/gulf_stream_forecast_comparison.gif",
                         },
                         "psd_plot": None if regional_masks is not None else "diagnostics/psd_comparison.png",
@@ -296,19 +305,31 @@ class OutputHandler:
         extent = (lon_min, lon_max, lat_min, lat_max)
         return extent, origin
 
+    def _to_anomaly(self, data: np.ndarray, mean_field: Optional[torch.Tensor]) -> np.ndarray:
+        """Subtract the mean field when available to form anomaly fields."""
+        if mean_field is None:
+            return data
+        mean_np = mean_field.detach().cpu().numpy()
+        return data - mean_np[None, :, :, :]
+
     def _save_forecast_animation(
         self,
         state_dir: Path,
         reference_forecast: torch.Tensor,
         optimized_forecast: torch.Tensor,
         input_sequence: xr.Dataset,
+        mean_field: Optional[torch.Tensor] = None,
     ) -> None:
         """Save side-by-side forecast animation (reference vs optimized) as GIF."""
         ref = reference_forecast.squeeze(0).detach().cpu().numpy()   # [T, C, H, W]
         opt = optimized_forecast.squeeze(0).detach().cpu().numpy()   # [T, C, H, W]
+        ref_anom = self._to_anomaly(ref, mean_field)
+        opt_anom = self._to_anomaly(opt, mean_field)
         horizon = min(ref.shape[0], opt.shape[0])
         ref = ref[:horizon]
         opt = opt[:horizon]
+        ref_anom = ref_anom[:horizon]
+        opt_anom = opt_anom[:horizon]
 
         fig, axes = plt.subplots(5, 2, figsize=(10, 16), constrained_layout=True)
         axes[0, 0].set_title("Reference forecast", fontsize=11, fontweight="bold")
@@ -373,11 +394,95 @@ class OutputHandler:
         finally:
             plt.close(fig)
 
-    def _save_ic_correction_figure(self, x0_init: torch.Tensor, x0_optimized: torch.Tensor, input_sequence: xr.Dataset) -> None:
-        """Save IC state-map visualization (initial / optimized / correction)."""
+        fig, axes = plt.subplots(5, 2, figsize=(10, 16), constrained_layout=True)
+        axes[0, 0].set_title("Reference anomaly", fontsize=11, fontweight="bold")
+        axes[0, 1].set_title("Optimized anomaly", fontsize=11, fontweight="bold")
+
+        images = []
+        for ch_idx in range(5):
+            var_name, _, long_name = self.VAR_METADATA[ch_idx]
+            merged = np.concatenate([ref_anom[:, ch_idx].ravel(), opt_anom[:, ch_idx].ravel()])
+            vmax = np.nanpercentile(np.abs(merged), 99)
+            vmax = max(vmax, 1e-12)
+
+            extent, origin = self._get_extent_origin(input_sequence)
+            im_ref = axes[ch_idx, 0].imshow(
+                ref_anom[0, ch_idx],
+                cmap="RdBu_r",
+                vmin=-vmax,
+                vmax=vmax,
+                animated=True,
+                extent=extent,
+                origin=origin,
+                aspect="auto",
+                interpolation="none",
+            )
+            im_opt = axes[ch_idx, 1].imshow(
+                opt_anom[0, ch_idx],
+                cmap="RdBu_r",
+                vmin=-vmax,
+                vmax=vmax,
+                animated=True,
+                extent=extent,
+                origin=origin,
+                aspect="auto",
+                interpolation="none",
+            )
+            try:
+                fig.colorbar(im_ref, ax=axes[ch_idx, 0], fraction=0.046, pad=0.02)
+                fig.colorbar(im_opt, ax=axes[ch_idx, 1], fraction=0.046, pad=0.02)
+            except Exception:
+                pass
+            images.append((im_ref, im_opt))
+
+            axes[ch_idx, 0].set_ylabel(f"{var_name}\n{long_name}", fontsize=9)
+            axes[ch_idx, 0].set_xticks([])
+            axes[ch_idx, 0].set_yticks([])
+            axes[ch_idx, 1].set_xticks([])
+            axes[ch_idx, 1].set_yticks([])
+
+        title = fig.suptitle("Forecast anomaly comparison | timestep 0", fontsize=13)
+
+        def _update_anom(frame_idx: int):
+            title.set_text(f"Forecast anomaly comparison | timestep {frame_idx}")
+            artists = [title]
+            for ch_idx in range(5):
+                im_ref, im_opt = images[ch_idx]
+                im_ref.set_data(ref_anom[frame_idx, ch_idx])
+                im_opt.set_data(opt_anom[frame_idx, ch_idx])
+                artists.extend([im_ref, im_opt])
+            return artists
+
+        anim = animation.FuncAnimation(
+            fig=fig,
+            func=_update_anom,
+            frames=horizon,
+            interval=500,
+            blit=False,
+            repeat=True,
+        )
+
+        out_path = state_dir / "forecast_comparison_anomaly.gif"
+        try:
+            anim.save(out_path, writer=animation.PillowWriter(fps=2))
+            logger.info(f"✓ Saved forecast anomaly animation: {out_path}")
+        finally:
+            plt.close(fig)
+
+    def _save_ic_correction_figure(
+        self,
+        x0_init: torch.Tensor,
+        x0_optimized: torch.Tensor,
+        input_sequence: xr.Dataset,
+        mean_field: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Save IC state-map visualization (raw and anomaly views)."""
         init_np = x0_init.squeeze(0).detach().cpu().numpy()      # [T=2, C, H, W]
         opt_np = x0_optimized.squeeze(0).detach().cpu().numpy()  # [T=2, C, H, W]
         delta_np = opt_np - init_np
+        init_anom = self._to_anomaly(init_np, mean_field)
+        opt_anom = self._to_anomaly(opt_np, mean_field)
+        delta_anom = opt_anom - init_anom
         t_idx = init_np.shape[0] - 1  # latest IC state
 
         # compute extent and origin from input_sequence
@@ -445,6 +550,68 @@ class OutputHandler:
         fig.savefig(out_path, dpi=200)
         plt.close(fig)
         logger.info(f"✓ Saved IC correction figure: {out_path}")
+
+        fig, axes = plt.subplots(5, 3, figsize=(15, 18), constrained_layout=True)
+        col_titles = ["Initial anomaly", "Optimized anomaly", "Correction anomaly"]
+        for col_idx, title in enumerate(col_titles):
+            axes[0, col_idx].set_title(title, fontsize=11, fontweight="bold")
+
+        for ch_idx in range(5):
+            var_name, _, long_name = self.VAR_METADATA[ch_idx]
+            init_field = init_anom[t_idx, ch_idx]
+            opt_field = opt_anom[t_idx, ch_idx]
+            delta_field = delta_anom[t_idx, ch_idx]
+
+            vmax_state = np.nanpercentile(np.abs(np.concatenate([init_field.ravel(), opt_field.ravel()])), 99)
+            vmax_state = max(vmax_state, 1e-12)
+            vmax_delta = np.nanpercentile(np.abs(delta_field), 99)
+            vmax_delta = max(vmax_delta, 1e-12)
+
+            im0 = axes[ch_idx, 0].imshow(
+                init_field,
+                cmap="RdBu_r",
+                vmin=-vmax_state,
+                vmax=vmax_state,
+                extent=extent,
+                origin=origin,
+                aspect="auto",
+                interpolation="none",
+            )
+            im1 = axes[ch_idx, 1].imshow(
+                opt_field,
+                cmap="RdBu_r",
+                vmin=-vmax_state,
+                vmax=vmax_state,
+                extent=extent,
+                origin=origin,
+                aspect="auto",
+                interpolation="none",
+            )
+            im2 = axes[ch_idx, 2].imshow(
+                delta_field,
+                cmap="RdBu_r",
+                vmin=-vmax_delta,
+                vmax=vmax_delta,
+                extent=extent,
+                origin=origin,
+                aspect="auto",
+                interpolation="none",
+            )
+
+            axes[ch_idx, 0].set_ylabel(f"{var_name}\n{long_name}", fontsize=9)
+            for col in range(3):
+                axes[ch_idx, col].set_xticks([])
+                axes[ch_idx, col].set_yticks([])
+
+            fig.colorbar(im0, ax=axes[ch_idx, 0], fraction=0.046, pad=0.02)
+            fig.colorbar(im1, ax=axes[ch_idx, 1], fraction=0.046, pad=0.02)
+            fig.colorbar(im2, ax=axes[ch_idx, 2], fraction=0.046, pad=0.02)
+
+        fig.suptitle("IC Correction Anomaly Visualization (latest IC timestep)", fontsize=14)
+        out_path = self.diagnostics_dir / "ic_correction_anomaly_comparison.png"
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        logger.info(f"✓ Saved IC correction anomaly figure: {out_path}")
 
     def _save_rmse_figure(
         self,

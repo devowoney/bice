@@ -192,12 +192,12 @@
 - Validation: `python -m py_compile` succeeded for modified files.
 - Status: Applied in-tree.
 
-## 2026-07-16 — TensorBoard IC-update fix
-- Fixed TensorBoard IC-update rendering in `src/gd_optimic/optimizer.py`: use `fig.canvas.buffer_rgba()` for matplotlib capture, and log per-channel fallback images separately under `state/ic/update_image/{var}`.
-- This resolved the `FigureCanvasAgg.tostring_rgb()` crash and the fallback `TypeError` from trying to log a 5-channel tensor as one image.
-- Kept the north-up lat/lon visualization and the single figure legend/colorbar for the main path.
-
 ## 2026-07-16 — Diagnostic anomaly views added
 - Added anomaly versions of the main diagnostic PNG/GIF in `src/gd_optimic/output_handler.py` using the shared mean field when available.
 - `save_outputs()` now receives `mean_field` from the metrics computer so raw and anomaly plots stay consistent with the anomaly diagnostics.
 - Saved outputs now include `diagnostics/ic_correction_anomaly_comparison.png` and `states/forecast_comparison_anomaly.gif` alongside the raw figures.
+
+## 2026-07-17 — TensorBoard IC-update fix
+- Fixed TensorBoard IC-update rendering in `src/gd_optimic/optimizer.py`: use `fig.canvas.buffer_rgba()` for matplotlib capture, and log per-channel fallback images separately under `state/ic/update_image/{var}`.
+- This resolved the `FigureCanvasAgg.tostring_rgb()` crash and the fallback `TypeError` from trying to log a 5-channel tensor as one image.
+- Kept the north-up lat/lon visualization and the single figure legend/colorbar for the main path.
