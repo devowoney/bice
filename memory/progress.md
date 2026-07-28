@@ -201,3 +201,21 @@
 - Fixed TensorBoard IC-update rendering in `src/gd_optimic/optimizer.py`: use `fig.canvas.buffer_rgba()` for matplotlib capture, and log per-channel fallback images separately under `state/ic/update_image/{var}`.
 - This resolved the `FigureCanvasAgg.tostring_rgb()` crash and the fallback `TypeError` from trying to log a 5-channel tensor as one image.
 - Kept the north-up lat/lon visualization and the single figure legend/colorbar for the main path.
+
+## 2026-07-17 — Gradient-norm scalar metric added
+- Added per-iteration gradient-norm scalars in `src/gd_optimic/optimizer.py` under `metrics/gradient/norm/total` and `metrics/gradient/norm/per_channel/{SSH,T,S,U,V}`.
+- The logged norm is computed from the masked last IC timestep, so it can be used as a scalar proxy for pixelization/artifacts during optimization.
+
+## 2026-07-18 — Laplacian roughness metric added
+- Added Laplacian-norm scalars in `src/gd_optimic/optimizer.py` under `metrics/gradient/norm/laplacian_total` and `metrics/gradient/norm/laplacian_per_channel/{SSH,T,S,U,V}`.
+- The Laplacian is applied to the masked last IC timestep, making it a better scalar proxy for pixelization / local roughness than plain gradient norm.
+
+## 2026-07-27 — Gradient-change metrics removed
+- Removed `temporal_jump` and `neighbor_smoothness` from `src/gd_optimic/optimizer.py`.
+- TensorBoard now focuses on loss, RMSE, IC RMSE, and update visualizations only.
+
+## 2026-07-27 — IC spatial-gradient metric added
+- Removed every previous pixelization diagnostic (wrong metrics).
+- Added a finite-difference IC update norm for the correction field in `src/gd_optimic/optimizer.py`.
+- TensorBoard logs `metrics/gradient/finite_difference_ic_update/{total,per_channel}` from the last IC update field.
+

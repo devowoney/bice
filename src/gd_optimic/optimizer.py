@@ -260,12 +260,14 @@ class ICOptimizer:
             # Compute loss
             loss, loss_details = self.loss_fn(y_hat_steps, target_sequence, return_details=True)
 
+            should_log = (iteration + 1) % self.log_frequency == 0
+
             # Backward pass: compute gradients
             gradients = torch.autograd.grad(loss, x0_current, create_graph=False)[0]
 
             # Apply gradient filtering
             filtered_gradients = self.gradient_filter(
-                gradients,
+                gradients.detach(),
                 x0_current=x0_current,
                 x0_reference=x0_reference,
                 kernel_size=current_kernel,
@@ -334,13 +336,20 @@ class ICOptimizer:
                 "ic_rmse": metrics["ic_rmse"],
             }
 
+            if self._last_ic_update is not None and self._ocean_mask is not None:
+                finite_diff_total, _ = self._compute_finite_difference_ic_update(
+                    self._last_ic_update[0, -1],
+                    self._ocean_mask.detach().cpu(),
+                )
+                history_entry["gradient_finite_difference_ic_update"] = finite_diff_total
+
             if regional_masks is not None:
                 history_entry["rmse_basin"] = metrics["rmse_basin"]
 
             self.history.append(history_entry)
 
             # Logging to TensorBoard
-            if (iteration + 1) % self.log_frequency == 0:
+            if should_log:
                 # Pass current and reference IC to TensorBoard logger so cumulative correction (from zero) can be visualized
                 self._log_to_tensorboard(
                     iteration + 1,
@@ -419,7 +428,6 @@ class ICOptimizer:
         Follows R8 decision on TensorBoard hierarchy:
         loss/J_obs/{total,ssh,sst,uo,vo}
         metrics/rmse/{global,basin}/{var}
-        metrics/gradient/norm/{total,per_channel}
         state/ic/{norm,update_magnitude}
         """
         # Loss metrics (per-variable)
@@ -445,8 +453,26 @@ class ICOptimizer:
         for var, rmse in metrics["ic_rmse"].items():
             self.writer.add_scalar(f"metrics/ic_rmse/{var}", rmse, iteration)
 
+        # Finite-difference IC update norm on the correction field
+        if self._last_ic_update is not None and self._ocean_mask is not None:
+            finite_diff_total, finite_diff_per_channel = self._compute_finite_difference_ic_update(
+                self._last_ic_update[0, -1],
+                self._ocean_mask.detach().cpu(),
+            )
+            self.writer.add_scalar(
+                "metrics/finite_difference_ic_update/total",
+                finite_diff_total,
+                iteration,
+            )
+            for var, norm in finite_diff_per_channel.items():
+                self.writer.add_scalar(
+                    f"metrics/finite_difference_ic_update/per_channel/{var}",
+                    norm,
+                    iteration,
+                )
+
         # Pooling kernel size
-        self.writer.add_scalar("state/pooling_kernel", kernel_size, iteration)
+        self.writer.add_scalar("optimizer/pooling_kernel", kernel_size, iteration)
 
         # IC correction/update visualization (per-step, coordinate-aware)
         # _last_ic_update: [B, T, C, H, W] on CPU
@@ -592,6 +618,37 @@ class ICOptimizer:
                     f"state/ic/{var_name}", ocean_points.detach().cpu().numpy(), iteration
                 )
 
+    def _compute_finite_difference_ic_update(
+        self,
+        field: torch.Tensor,
+        ocean_mask: torch.Tensor,
+    ) -> Tuple[float, Dict[str, float]]:
+        """Compute finite-difference IC update norms for a [C, H, W] field."""
+        var_names = ["SSH", "T", "S", "U", "V"]
+        total_sq = 0.0
+        per_channel = {}
+
+        for ch_idx, var_name in enumerate(var_names):
+            img = field[ch_idx]
+            mask = ocean_mask[ch_idx].to(img)
+
+            channel_sq = 0.0
+
+            if img.shape[1] > 1:
+                gx = img[:, 1:] - img[:, :-1]
+                gx_mask = mask[:, 1:] * mask[:, :-1]
+                channel_sq += float((gx.pow(2) * gx_mask).sum().item())
+
+            if img.shape[0] > 1:
+                gy = img[1:, :] - img[:-1, :]
+                gy_mask = mask[1:, :] * mask[:-1, :]
+                channel_sq += float((gy.pow(2) * gy_mask).sum().item())
+
+            per_channel[var_name] = float(np.sqrt(channel_sq))
+            total_sq += channel_sq
+
+        return float(np.sqrt(total_sq)), per_channel
+
     def _print_progress(self, iteration: int, loss: float, metrics: Dict, kernel_size: int):
         """
         Print optimization progress.
@@ -707,7 +764,8 @@ class ICOptimizer:
                     regional_masks=regional_masks,
                     ocean_mask=ocean_mask,
                     best_iteration=self.best_iteration,
-                    best_loss=self.best_loss
+                    best_loss=self.best_loss,
+                    mean_field=self.metrics_computer.mean_field,
                 )
             except Exception as e:
                 logger.error(f"Failed to save outputs: {e}", exc_info=True)

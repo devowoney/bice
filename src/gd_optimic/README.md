@@ -96,7 +96,7 @@ configs/optimize_ic.yaml  # Hydra configuration
 ```
 loss/J_obs/{total,ssh,sst,uo,vo}
 metrics/rmse/{global,basin}/{var}
-metrics/gradient/norm/{total,per_channel}
+metrics/finite_difference_ic_update/{total,per_channel}
 state/ic/{norm,update_magnitude}
 ```
 
