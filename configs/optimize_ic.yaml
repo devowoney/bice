@@ -35,8 +35,8 @@ data:
   sst_obs_files:
     - "ODYSSEA_SST_2021-01-01_to_2021-12-31/combined_obs_2021-01-01_to_2021-04-02.nc"
   
-  # Mean dynamic topography (for real SSH obs)
-  mdt_file: null  # Set when using obs_mode='real'
+  # Mean/stats file 
+  stats_file: "/Odyssey/public/glonet/statistics/mdt_glorys12_2020.nc"  
   
   # Variance map (for regional masking)
   variance_ssh_path: "/Odyssey/public/data_challenge_ssh_ose/data/sad/variance_cmems_dt_allsat.nc"
@@ -84,6 +84,33 @@ optimization:
   learning_rate: 10
   num_iterations: 300
   
+  # Meta-learner configuration (Phase P)
+  use_meta_learner: false  # Set to true to enable bi-level meta-learning
+  
+  meta_learner:
+    # NetworkS (UNet) architecture
+    base_channels: 32        # Base channel count for UNet encoder
+    num_groups: 8            # GroupNorm parameter groups
+    output_scale: 0.01       # Soft tanh damping scale
+    
+    # Meta-optimization
+    meta_lr: 1.0e-5          # Meta learning rate for NetworkS parameters
+    num_meta_steps: 50       # Gradient steps per IC iteration (reduced from 10 to save memory)
+    
+    # Meta-loss weights
+    grad_perf_steps: 30
+    grad_trans_steps: 10
+    w_align: 1e0
+    w_perf: 1e2
+    lambda_reg: 1.0e-2       # L2 parameter regularization
+    
+    # Gradient management
+    grad_clip_norm: 1.0      # Gradient clipping threshold
+    
+    # Physical constraints
+    freeze_glonet: true      # Keep glonet weights frozen (A1)
+    apply_ocean_mask: true   # Zero land regions in updates (A4)
+  
   # Gradient filtering
   gradient_filter: "none"  # Options: 'none', 'weight', 'delta', 'pooling', 'pooling+weight'
   
@@ -96,15 +123,16 @@ optimization:
     initial_kernel: 24  # Starting kernel size (coarse)
     final_kernel: 1     # Ending kernel size (fine)
     schedule_steps:     # Iterations to change kernel
-      - 100
-      - 200
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 210
+      - 240
+      - 270
       - 300
-      - 400
-      - 500
-      - 600
-      - 700
-      - 800
-      - 900
     kernel_sizes:       # Corresponding kernel sizes at each step
       - 24  # [0, 100)
       - 8   # [100, 200)
@@ -116,7 +144,7 @@ optimization:
       - 4   # [700, 800) - coarsen again
       - 1   # [800, 900)
       - 2   # [900, 1000)
-      - 1   # [1000+]
+      - 4   # [1000+]
 
 # Metrics configuration (follows R4 decisions)
 metrics:

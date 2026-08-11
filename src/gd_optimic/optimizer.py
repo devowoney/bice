@@ -34,6 +34,7 @@ from .loss import ObservationLoss
 from .gradient import GradientFilter, ScheduledPooling
 from .metrics import MetricsComputer
 from .output_handler import OutputHandler
+from .meta_learner import BiLevelICOptimizer, UNetMetaGrad2D, NetworkSConfig
 import xarray as xr
 
 
@@ -71,27 +72,51 @@ class ICOptimizer:
         histogram_frequency: int = 50,
         scheduled_pooling: Optional[ScheduledPooling] = None,
         forecast_horizon: int = 28,
+        use_meta_learner: bool = False,
+        meta_learner_config: Optional[Dict] = None,
     ):
         """
-        Initialize IC optimizer.
+        Initialize IC optimizer (standard gradient descent or meta-learning).
 
         Args:
-            forward_model: Forward model wrapper
-            loss_fn: Loss function (observation term)
-            gradient_filter: Gradient filtering object
-            metrics_computer: Metrics computation object
-            learning_rate: Gradient descent learning rate
-            num_iterations: Total number of optimization iterations
+            forward_model: Forward model wrapper for loss computation
+            loss_fn: Loss function (observation - forecast)²
+            gradient_filter: Gradient filtering object for preprocessing gradients
+            metrics_computer: Metrics computation object for diagnostics
+            learning_rate: Gradient descent learning rate for IC optimization
+            num_iterations: Total number of optimization iterations (outer loop)
             device: PyTorch device ('cuda' or 'cpu')
             output_dir: Base output directory (typically .tmp/outputs)
-            tensorboard_subdir: Subdirectory for TensorBoard logs (inside exp_id dir)
-            checkpoints_subdir: Subdirectory for checkpoints (inside exp_id dir)
-            metrics_subdir: Subdirectory for metrics (inside exp_id dir)
+            tensorboard_subdir: Subdirectory for TensorBoard logs
+            checkpoints_subdir: Subdirectory for checkpoints
+            metrics_subdir: Subdirectory for metrics
             save_frequency: Save checkpoint every N iterations
             log_frequency: Log metrics every N iterations
             histogram_frequency: Log histograms/embeddings every N iterations
             scheduled_pooling: Optional scheduled pooling object for multigrid optimization
             forecast_horizon: Number of forecast steps for diagnostics (default: 28)
+            use_meta_learner: Whether to use bi-level meta-learning (Phase P = meta-learned IC optimization)
+            meta_learner_config: Configuration dict for BiLevelICOptimizer with keys:
+                - enabled: bool, whether meta-learning is active (default: True)
+                - meta_lr: Learning rate for network_s (default: 1e-3, typically 1e-4)
+                - num_meta_steps: Number of IC updates per outer iteration (default: 10)
+                - grad_align_steps: Number of ALIGN phase steps (default: 6)
+                - w_align: Weight on gradient alignment loss (ALIGN phase, default: 1.0)
+                - w_perf: Weight on performance/forecast loss (PERF phase, default: 1.0)
+                - lambda_reg: Weight on L2 regularization (default: 1e-4, prevents parameter explosion)
+                - base_channels: UNet base channels for network_s (default: 32)
+                - output_scale: Scaling factor for network_s output (default: 0.01)
+                
+                CURRICULUM LEARNING STRATEGY:
+                - ALIGN (m < grad_align_steps): Trains network_s to predict gradient-aligned updates
+                  * Loss: l_align + l_reg, where l_align = ||network_s(x) - ∇_x||_2
+                  * Goal: Learn physical patterns that match observed gradients
+                  * Expected: l_align DECREASES as network learns gradient shape
+                
+                - PERF (m >= grad_align_steps): Refines updates to maximize loss reduction
+                  * Loss: w_perf * L_perf + [optional: weak l_align] + l_reg
+                  * Goal: Make IC updates that actually improve forecasts
+                  * Expected: L_perf DECREASES, improvement POSITIVE (forecasts get better)
         """
         self.forward_model = forward_model
         self.loss_fn = loss_fn
@@ -121,6 +146,16 @@ class ICOptimizer:
         self.input_sequence_xr = None
         self.target_sequence_xr = None
         self.ground_truth_sequence_xr = None
+
+        # Meta-learner setup (Phase P)
+        self.use_meta_learner = use_meta_learner
+        self.meta_learner = None
+        self.meta_learner_config = meta_learner_config or {}
+        if self.use_meta_learner:
+            logger.info("Meta-learner (Phase P) is ENABLED")
+            # BiLevelICOptimizer will be instantiated in optimize() once we know the IC shape
+        else:
+            logger.info("Using standard gradient descent (no meta-learner)")
 
         # Writer and output handler initialized later after exp_id is set
         self.writer = None
@@ -221,6 +256,44 @@ class ICOptimizer:
         # Number of forward steps to roll out (for assimilation window)
         num_forecast_steps = target_sequence.shape[1]
 
+        # Initialize meta-learner if enabled (Phase P)
+        if self.use_meta_learner:
+            logger.info("\nInitializing BiLevelICOptimizer ...")
+            # Create NetworkS config from meta_learner_config
+            # T=2 (temporal steps for IC), C=5 (channels)
+            network_s_config = NetworkSConfig(
+                base_channels=self.meta_learner_config.get('base_channels', 32),
+                num_groups=self.meta_learner_config.get('num_groups', 8),
+                output_scale=self.meta_learner_config.get('output_scale', 0.01),
+                temporal_steps=2,  # IC has T=2 steps
+                input_channels=5,  # SSH, T, S, U, V
+                output_channels=5,
+            )
+            
+            # Instantiate UNetMetaGrad2D
+            network_s = UNetMetaGrad2D(network_s_config).to(self.device)
+            logger.info(f"--------------------------------------------")
+            logger.info(f"UNetMetaGrad2D parameters: {network_s.get_parameter_count():,}")
+            logger.info(f"--------------------------------------------")
+            
+            # Instantiate BiLevelICOptimizer
+            # BiLevelICOptimizer signature: (network_s, ocean_mask, device='cuda', config=None)
+            # Pass forward_model and loss_fn so meta-learner can recompute loss inside meta loop
+            self.meta_learner = BiLevelICOptimizer(
+                network_s,
+                ocean_mask,
+                forward_model=self.forward_model,
+                loss_fn=self.loss_fn,
+                num_forecast_steps=num_forecast_steps,
+                device=self.device,
+                config=self.meta_learner_config,
+                writer=self.writer,
+            )
+            logger.info("  BiLevelICOptimizer initialized successfully\n")
+
+            # Track meta-learning metrics in history
+            self._j_prev = None
+
         logger.info(f"\n{'='*60}")
         logger.info("Starting IC Optimization")
         logger.info(f"{'='*60}")
@@ -228,6 +301,22 @@ class ICOptimizer:
         logger.info(f"Target sequence shape: {target_sequence.shape}")
         logger.info(f"Forecast steps: {num_forecast_steps}")
         logger.info(f"Learning rate: {self.learning_rate}")
+        if self.use_meta_learner:
+            logger.info(f"Meta-learner: ENABLED (Phase P - Bi-level optimization)")
+            logger.info(f"  Two-phase curriculum learning:")
+            logger.info(f"  - ALIGN phase (first {self.meta_learner_config.get('grad_align_steps', 6)} steps): Learn gradient-aligned patterns")
+            logger.info(f"  - PERF phase (remaining steps): Maximize loss reduction")
+            logger.info(f"  Configuration:")
+            logger.info(f"    * Meta LR: {self.meta_learner_config.get('meta_lr', 1e-3)}")
+            logger.info(f"    * Num meta-steps per iteration: {self.meta_learner_config.get('num_meta_steps', 10)}")
+            logger.info(f"    * Weights: w_align={self.meta_learner_config.get('w_align', 1.0)}, "
+                        f"w_perf={self.meta_learner_config.get('w_perf', 1.0)}, "
+                        f"lambda_reg={self.meta_learner_config.get('lambda_reg', 1e-4)}")
+            logger.info(f"  Expected metrics:")
+            logger.info(f"    * ALIGN: l_align DECREASES (learning gradient shape)")
+            logger.info(f"    * PERF: L_perf DECREASES, improvement POSITIVE (IC updates working)")
+        else:
+            logger.info(f"Meta-learner: DISABLED (standard gradient descent only)")
         logger.info(f"Num iterations: {self.num_iterations}")
         if self.scheduled_pooling is not None:
             logger.info(f"Scheduled pooling: {self.scheduled_pooling.schedule_type}")
@@ -274,32 +363,82 @@ class ICOptimizer:
             )
 
             # Apply ocean mask to gradients (zero out land gradients)
-            with torch.no_grad():
-                # Ensure ocean_mask matches channel dimension of gradients
-                if ocean_mask.dim() == 3 and ocean_mask.shape[0] != filtered_gradients.shape[2]:
-                    mask_ch = int(ocean_mask.shape[0])
-                    grad_ch = int(filtered_gradients.shape[2])
-                    logger.warning(
-                        "Ocean mask channels (%d) != gradients channels (%d). Adjusting mask.", mask_ch, grad_ch
+            # Adjust ocean_mask channel dimension if necessary
+            if ocean_mask.dim() == 3 and ocean_mask.shape[0] != filtered_gradients.shape[2]:
+                mask_ch = int(ocean_mask.shape[0])
+                grad_ch = int(filtered_gradients.shape[2])
+                logger.warning(
+                    "Ocean mask channels (%d) != gradients channels (%d). Adjusting mask.", mask_ch, grad_ch
+                )
+                if mask_ch >= grad_ch:
+                    ocean_mask = ocean_mask[:grad_ch, :, :]
+                else:
+                    raise ValueError(
+                        f"Ocean mask has fewer channels ({mask_ch}) than gradients ({grad_ch})."
                     )
-                    if mask_ch >= grad_ch:
-                        ocean_mask = ocean_mask[:grad_ch, :, :]
-                    else:
-                        raise ValueError(
-                            f"Ocean mask has fewer channels ({mask_ch}) than gradients ({grad_ch})."
-                        )
 
-                masked_gradients = filtered_gradients * ocean_mask.unsqueeze(0).unsqueeze(0)
+            # Compute masked gradients (no grad needed)
+            masked_gradients = filtered_gradients * ocean_mask.unsqueeze(0).unsqueeze(0)
 
-                # Compute update to apply (store for logging)
-                ic_update = self.learning_rate * masked_gradients
-                # Save last update on CPU for TensorBoard logging
-                self._last_ic_update = ic_update.detach().cpu().clone()
+            # Default history meta loss
+            history_meta_loss = None
 
-                # Gradient descent update
-                x0_current = x0_current - ic_update
+            # If meta-learner disabled: apply standard gradient descent update inside no_grad
+            if not self.use_meta_learner:
+                with torch.no_grad():
+                    ic_update = self.learning_rate * masked_gradients
+                    # Save last update on CPU for TensorBoard logging
+                    self._last_ic_update = ic_update.detach().cpu().clone()
+                    x0_current = x0_current - ic_update
+                    # Ensure x0_current requires grad for next iteration
+                    x0_current = x0_current.detach().requires_grad_(True)
+            else:
+                # Meta-learner path: predict IC update without graph
+                with torch.no_grad():
+                    ic_update = self.meta_learner.predict_update(x0_current.detach()).requires_grad_(True)
+                    self._last_ic_update = ic_update.detach().cpu().clone()
+                    x0_current = x0_current - ic_update
 
-                # Ensure x0_current requires grad for next iteration
+                # Compute loss at new IC for meta-learner
+                with torch.no_grad():
+                    _, y_hat_steps_new = self.forward_model.forward(x0_current, num_forecast_steps)
+                    loss_current, _ = self.loss_fn(
+                        y_hat_steps_new, target_sequence, return_details=True
+                    )
+
+                # Initialize loss history on first iteration
+                if self._j_prev is None:
+                    self._j_prev = loss.item()
+
+                # Multi-step meta-optimization of network S parameters
+                self.meta_learner.target_sequence = target_sequence
+                meta_diags = self.meta_learner.step(
+                    first_update=ic_update,
+                    x_current=x0_current,
+                    loss_prev=self._j_prev,
+                    gradient_prev=masked_gradients,
+                    iteration=iteration,
+                )
+
+                # Update loss history for next iteration
+                self._j_prev = float(loss_current.detach().cpu().item())
+
+                # Extract meta-loss for logging
+                history_meta_loss = meta_diags.get("L_meta", None) if isinstance(meta_diags, dict) else None
+
+                # Log meta-loss scalars to TensorBoard (L_meta and components)
+                try:
+                    if isinstance(meta_diags, dict) and self.writer is not None:
+                        if meta_diags.get("L_align") is not None:
+                            self.writer.add_scalar("meta/L_align", float(meta_diags.get("L_align")), iteration + 1)
+                        if meta_diags.get("L_perf") is not None:
+                            self.writer.add_scalar("meta/L_perf", float(meta_diags.get("L_perf")), iteration + 1)
+                        if meta_diags.get("L_reg") is not None:
+                            self.writer.add_scalar("meta/L_reg", float(meta_diags.get("L_reg")), iteration + 1)
+                except Exception:
+                    logger.exception("Failed to write meta loss components to TensorBoard")
+
+                # Detach x0_current for next outer iteration to avoid graph growth
                 x0_current = x0_current.detach().requires_grad_(True)
 
             # Compute metrics (with no_grad to save memory)
@@ -335,6 +474,10 @@ class ICOptimizer:
                 "rmse_global": metrics["rmse_global"],
                 "ic_rmse": metrics["ic_rmse"],
             }
+
+            # Add meta-learning metrics if enabled
+            if self.use_meta_learner and history_meta_loss is not None:
+                history_entry["meta_loss"] = history_meta_loss
 
             if self._last_ic_update is not None and self._ocean_mask is not None:
                 finite_diff_total, _ = self._compute_finite_difference_ic_update(
@@ -430,6 +573,14 @@ class ICOptimizer:
         metrics/rmse/{global,basin}/{var}
         state/ic/{norm,update_magnitude}
         """
+        """
+        Log metrics to TensorBoard.
+
+        Follows R8 decision on TensorBoard hierarchy:
+        loss/J_obs/{total,ssh,sst,uo,vo}
+        metrics/rmse/{global,basin}/{var}
+        state/ic/{norm,update_magnitude}
+        """
         # Loss metrics (per-variable)
         per_var = loss_details["per_variable"]
         self.writer.add_scalar("loss/J_obs/total", per_var["total"].mean().item(), iteration)
@@ -460,13 +611,13 @@ class ICOptimizer:
                 self._ocean_mask.detach().cpu(),
             )
             self.writer.add_scalar(
-                "metrics/finite_difference_ic_update/total",
+                "diag/finite_difference_ic_update/total",
                 finite_diff_total,
                 iteration,
             )
             for var, norm in finite_diff_per_channel.items():
                 self.writer.add_scalar(
-                    f"metrics/finite_difference_ic_update/per_channel/{var}",
+                    f"diag/finite_difference_ic_update/per_channel/{var}",
                     norm,
                     iteration,
                 )

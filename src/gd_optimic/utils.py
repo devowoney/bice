@@ -343,39 +343,32 @@ class ForwardModel:
         if self.ocean_mask is not None:
             x0_normalized = x0_normalized * self.ocean_mask.unsqueeze(0).unsqueeze(0)
 
-        # First forward pass
+        # Define rollout function that performs the entire autoregressive loop
+        def _rollout(x):
+            # x: normalized input [B, T=2, C, H, W]
+            y_hat_local = self.model(x)
+            y_hat_last_local = y_hat_local[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
+            y_hat_denorm_local = self.denormalizer(y_hat_last_local) * self.ocean_mask.unsqueeze(0)
+            y_hat_steps_local = [y_hat_denorm_local]
+            y_hat_local = torch.stack([x[:, -1, :, :, :], y_hat_last_local], dim=1)
+
+            for _ in range(num_steps - 1):
+                y_hat_first_local = y_hat_local[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
+                y_hat_local = self.model(y_hat_local)
+                y_hat_last_local = y_hat_local[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
+                y_hat_denorm_local = self.denormalizer(y_hat_last_local) * self.ocean_mask.unsqueeze(0)
+                y_hat_steps_local.append(y_hat_denorm_local)
+                y_hat_local = torch.stack([y_hat_first_local, y_hat_last_local], dim=1)
+
+            return torch.stack(y_hat_steps_local, dim=1)
+
+        # Run rollout with optional single-checkpoint wrapper to save activation memory
         if self.use_gradient_checkpointing:
-            y_hat = torch.utils.checkpoint.checkpoint(
-                self.model, x0_normalized, use_reentrant=False
-            )
+            # Checkpoint the entire rollout so intermediate activations are not stored.
+            # use_reentrant=False is required when later using autograd.grad/create_graph.
+            y_hat_steps = torch.utils.checkpoint.checkpoint(_rollout, x0_normalized, use_reentrant=False)
         else:
-            y_hat = self.model(x0_normalized)
-
-        # y_hat is [B, T=2, C, H, W], extract last timestep and denormalize
-        y_hat_last = y_hat[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
-
-        y_hat_denorm = self.denormalizer(y_hat_last) * self.ocean_mask.unsqueeze(0)
-
-        y_hat_steps = [y_hat_denorm]
-        y_hat = torch.stack([x0_normalized[:, -1, :, :, :], y_hat_last], dim=1)
-
-        # Autoregressive forecasting for remaining steps
-        for step_idx in range(num_steps - 1):
-            y_hat_first = y_hat[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
-            # Feed model output directly back as input for next step
-            if self.use_gradient_checkpointing:
-                y_hat = torch.utils.checkpoint.checkpoint(self.model, y_hat, use_reentrant=False)
-            else:
-                y_hat = self.model(y_hat)
-
-            # Extract last timestep and denormalize
-            y_hat_last = y_hat[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
-            y_hat_denorm = self.denormalizer(y_hat_last) * self.ocean_mask.unsqueeze(0)
-            y_hat_steps.append(y_hat_denorm)
-            y_hat = torch.stack([y_hat_first, y_hat_last], dim=1)
-
-        # Stack all predictions: [B, num_steps, C, H, W]
-        y_hat_steps = torch.stack(y_hat_steps, dim=1)
+            y_hat_steps = _rollout(x0_normalized)
 
         return x0_normalized, y_hat_steps
 

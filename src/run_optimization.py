@@ -311,6 +311,8 @@ def main(cfg: DictConfig):
         histogram_frequency=cfg.logging.histogram_frequency,
         scheduled_pooling=scheduled_pooling,
         forecast_horizon=cfg.data.forecast_horizon,
+        use_meta_learner=cfg.optimization.get("use_meta_learner", False),
+        meta_learner_config=dict(cfg.optimization.meta_learner) if cfg.optimization.get("use_meta_learner", False) else None,
     )
      
     logger.info("Initialized optimizer")

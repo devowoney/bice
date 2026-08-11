@@ -169,6 +169,11 @@ def main(cfg: DictConfig):
     # exp_output_dir = base_output / exp_id
     exp_output_dir = Path(".")
     # exp_output_dir.mkdir(parents=True, exist_ok=True)
+    # # Create experiment directory under the configured base output_dir (e.g., runs/{exp_id})
+    # base_output = Path(cfg.logging.output_dir)
+    # exp_output_dir = base_output / exp_id
+    exp_output_dir = Path('.')
+    # exp_output_dir.mkdir(parents=True, exist_ok=True)
     # Save a copy of the active config to the experiment folder for reproducibility
     cfg_path = exp_output_dir / "config.yaml"
     with open(cfg_path, "w") as cf:
@@ -383,6 +388,8 @@ def main(cfg: DictConfig):
         histogram_frequency=cfg.logging.histogram_frequency,
         scheduled_pooling=scheduled_pooling,
         forecast_horizon=cfg.data.forecast_horizon,
+        use_meta_learner=cfg.optimization.get("use_meta_learner", False),
+        meta_learner_config=dict(cfg.optimization.meta_learner) if cfg.optimization.get("use_meta_learner", False) else None,
     )
     logger.info("Initialized optimizer")
 
