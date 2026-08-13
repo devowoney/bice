@@ -428,7 +428,7 @@ class BiLevelICOptimizer:
             # TensorBoard logging
             if self.writer is not None:
                 global_step = iteration * self.num_meta_steps + m + 1
-                self.writer.add_scalar(f"meta_steps/L_combined", last_l_combined, global_step)
+                self.writer.add_scalar(f"meta_steps/l_combined", last_l_combined, global_step)
                 self.writer.add_scalar(f"meta_steps/L_align", last_l_align, global_step)
                 self.writer.add_scalar(f"meta_steps/L_perf", last_l_perf, global_step)
                 self.writer.add_scalar(f"meta_steps/L_reg", last_l_reg, global_step)

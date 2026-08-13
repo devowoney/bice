@@ -95,14 +95,14 @@ optimization:
     
     # Meta-optimization
     meta_lr: 1.0e-5          # Meta learning rate for NetworkS parameters
-    num_meta_steps: 50       # Gradient steps per IC iteration (reduced from 10 to save memory)
+    num_meta_steps: 20       # Gradient steps per IC iteration (reduced from 10 to save memory)
     
     # Meta-loss weights
-    grad_perf_steps: 30
-    grad_trans_steps: 10
+    grad_perf_steps: 10
+    grad_trans_steps: 5
     w_align: 1e0
-    w_perf: 1e2
-    lambda_reg: 1.0e-2       # L2 parameter regularization
+    w_perf: 1e1
+    lambda_reg: 1.0e-1       # L2 parameter regularization
     
     # Gradient management
     grad_clip_norm: 1.0      # Gradient clipping threshold

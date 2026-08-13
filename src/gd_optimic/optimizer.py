@@ -582,13 +582,13 @@ class ICOptimizer:
         state/ic/{norm,update_magnitude}
         """
         # Loss metrics (per-variable)
-        per_var = loss_details["per_variable"]
+        per_var = loss_details["weighted_per_variable"]
         self.writer.add_scalar("loss/J_obs/total", per_var["total"].mean().item(), iteration)
-        self.writer.add_scalar("loss/J_obs/ssh", per_var["ssh"].mean().item(), iteration)
-        self.writer.add_scalar("loss/J_obs/sst", per_var["sst"].mean().item(), iteration)
-        self.writer.add_scalar("loss/J_obs/sss", per_var["sss"].mean().item(), iteration)
-        self.writer.add_scalar("loss/J_obs/uo", per_var["uo"].mean().item(), iteration)
-        self.writer.add_scalar("loss/J_obs/vo", per_var["vo"].mean().item(), iteration)
+        self.writer.add_scalar("loss/J_obs/SSH", per_var["ssh"].mean().item(), iteration)
+        self.writer.add_scalar("loss/J_obs/SST", per_var["sst"].mean().item(), iteration)
+        self.writer.add_scalar("loss/J_obs/SSS", per_var["sss"].mean().item(), iteration)
+        self.writer.add_scalar("loss/J_obs/UO", per_var["uo"].mean().item(), iteration)
+        self.writer.add_scalar("loss/J_obs/VO", per_var["vo"].mean().item(), iteration)
 
         # RMSE metrics (global)
         for var, rmse in metrics["rmse_global"].items():
@@ -604,7 +604,7 @@ class ICOptimizer:
         for var, rmse in metrics["ic_rmse"].items():
             self.writer.add_scalar(f"metrics/ic_rmse/{var}", rmse, iteration)
 
-        # Finite-difference IC update norm on the correction field
+        # Finite-difference IC update norm on the step correction field
         if self._last_ic_update is not None and self._ocean_mask is not None:
             finite_diff_total, finite_diff_per_channel = self._compute_finite_difference_ic_update(
                 self._last_ic_update[0, -1],
@@ -622,10 +622,31 @@ class ICOptimizer:
                     iteration,
                 )
 
+            # Also measure the cumulative correction relative to the original IC.
+            if x0_current is not None and x0_reference is not None:
+                cumulative_update = x0_current[0, -1] - x0_reference[0, -1]
+                cumulative_total, cumulative_per_channel = (
+                    self._compute_finite_difference_ic_update(
+                        cumulative_update,
+                        self._ocean_mask.detach().cpu(),
+                    )
+                )
+                self.writer.add_scalar(
+                    "diag/finite_difference_ic_update/cumulative/total",
+                    cumulative_total,
+                    iteration,
+                )
+                for var, norm in cumulative_per_channel.items():
+                    self.writer.add_scalar(
+                        f"diag/finite_difference_ic_update/cumulative/per_channel/{var}",
+                        norm,
+                        iteration,
+                    )
+
         # Pooling kernel size
         self.writer.add_scalar("optimizer/pooling_kernel", kernel_size, iteration)
 
-        # IC correction/update visualization (per-step, coordinate-aware)
+        # IC correction/update visualizations (per-step and cumulative, coordinate-aware)
         # _last_ic_update: [B, T, C, H, W] on CPU
         if self._last_ic_update is not None and self._ocean_mask is not None:
             import numpy as _np
@@ -636,101 +657,109 @@ class ICOptimizer:
             # Last applied IC update: [C, H, W]
             last_update = self._last_ic_update[0, -1]
             masked_update_all = last_update * self._ocean_mask.detach().cpu()
+            update_images = [("step/ic_update", masked_update_all, "per-step")]
+
+            if x0_current is not None and x0_reference is not None:
+                total_update = x0_current[0, -1] - x0_reference[0, -1]
+                masked_total_update = total_update.detach().cpu() * self._ocean_mask.detach().cpu()
+                update_images.append(("total/ic_update", masked_total_update, "cumulative"))
 
             if masked_update_all.numel() > 0:
                 import matplotlib
                 matplotlib.use("Agg")
                 import matplotlib.pyplot as plt
 
-                try:
-                    extent = None
-                    origin = "lower"
-                    if (
-                        self.input_sequence_xr is not None
-                        and "lat" in self.input_sequence_xr.coords
-                        and "lon" in self.input_sequence_xr.coords
-                    ):
-                        lat = self.input_sequence_xr.coords["lat"].values
-                        lon = self.input_sequence_xr.coords["lon"].values
-                        extent = (float(_np.min(lon)), float(_np.max(lon)), float(_np.min(lat)), float(_np.max(lat)))
-                        origin = "lower" if float(lat[0]) < float(lat[-1]) else "upper"
-
-                    fig, axes = plt.subplots(5, 1, figsize=(11, 18), dpi=100, constrained_layout=True)
-                    if not isinstance(axes, _np.ndarray):
-                        axes = _np.array([axes])
-
-                    fig.suptitle("IC update by step (north up, lon/lat coordinates)", fontsize=13)
-
-                    for ch_idx, ax in enumerate(axes):
-                        arr = masked_update_all[ch_idx].detach().cpu().numpy()
-                        var_name = var_names[ch_idx] if ch_idx < len(var_names) else f"ch{ch_idx}"
-                        ch_abs = float(_np.nanmax(_np.abs(arr))) if arr.size > 0 else 1.0
-                        if not _np.isfinite(ch_abs) or ch_abs == 0.0:
-                            ch_abs = 1.0
-
-                        im = ax.imshow(
-                            arr,
-                            cmap="seismic",
-                            vmin=-ch_abs,
-                            vmax=ch_abs,
-                            interpolation="nearest",
-                            origin=origin,
-                            aspect="auto",
-                            extent=extent,
-                        )
-                        ax.set_title(f"{var_name} update ({units_map.get(var_name, '')})", fontsize=10)
-                        ax.set_xlabel("lon")
-                        ax.set_ylabel("lat")
-                        ax.tick_params(labelsize=8)
-                        # ax.text(
-                        #     0.02,
-                        #     0.98,
-                        #     "N ↑    E →",
-                        #     transform=ax.transAxes,
-                        #     color="white",
-                        #     fontsize=8,
-                        #     ha="left",
-                        #     va="top",
-                        #     bbox=dict(facecolor="black", alpha=0.6, pad=2, edgecolor="none"),
-                        # )
-                        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
-
-                    legend_text = (
-                        "IC update = learning_rate × filtered_gradient × ocean_mask\n"
-                        "Color shows the per-step correction in physical units."
+                extent = None
+                origin = "lower"
+                if (
+                    self.input_sequence_xr is not None
+                    and "lat" in self.input_sequence_xr.coords
+                    and "lon" in self.input_sequence_xr.coords
+                ):
+                    lat = self.input_sequence_xr.coords["lat"].values
+                    lon = self.input_sequence_xr.coords["lon"].values
+                    extent = (
+                        float(_np.min(lon)),
+                        float(_np.max(lon)),
+                        float(_np.min(lat)),
+                        float(_np.max(lat)),
                     )
-                    fig.text(
-                        0.01,
-                        0.005,
-                        legend_text,
-                        fontsize=8,
-                        color="black",
-                        bbox=dict(facecolor="white", alpha=0.75, pad=3, edgecolor="none"),
-                    )
+                    origin = "lower" if float(lat[0]) < float(lat[-1]) else "upper"
 
-                    fig.canvas.draw()
-                    img_buf = _np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
-                    self.writer.add_image("state/ic/update_image", img_buf, iteration, dataformats="HWC")
-                except Exception:
-                    # Fallback: normalized raster if plotting fails.
-                    update_np = masked_update_all.detach().cpu().numpy()
-                    for ch_idx, var_name in enumerate(var_names):
-                        ch_arr = update_np[ch_idx]
-                        ch_abs = float(_np.nanmax(_np.abs(ch_arr)))
-                        if not _np.isfinite(ch_abs) or ch_abs == 0.0:
-                            ch_abs = 1.0
-                        norm_ch = ((ch_arr / (2.0 * ch_abs)) + 0.5).clip(0.0, 1.0)
-                        self.writer.add_image(
-                            f"state/ic/update_image/{var_name}",
-                            norm_ch[None, :, :],
-                            iteration,
-                            dataformats="CHW",
-                        )
-                finally:
+                for image_tag, update_image, update_kind in update_images:
                     try:
-                        plt.close("all")
+                        fig, axes = plt.subplots(
+                            5, 1, figsize=(11, 18), dpi=100, constrained_layout=True
+                        )
+                        if not isinstance(axes, _np.ndarray):
+                            axes = _np.array([axes])
+
+                        fig.suptitle(
+                            f"IC {update_kind} update (north up, lon/lat coordinates)",
+                            fontsize=13,
+                        )
+
+                        for ch_idx, ax in enumerate(axes):
+                            arr = update_image[ch_idx].detach().cpu().numpy()
+                            var_name = var_names[ch_idx] if ch_idx < len(var_names) else f"ch{ch_idx}"
+                            ch_abs = float(_np.nanmax(_np.abs(arr))) if arr.size > 0 else 1.0
+                            if not _np.isfinite(ch_abs) or ch_abs == 0.0:
+                                ch_abs = 1.0
+
+                            im = ax.imshow(
+                                arr,
+                                cmap="seismic",
+                                vmin=-ch_abs,
+                                vmax=ch_abs,
+                                interpolation="nearest",
+                                origin=origin,
+                                aspect="auto",
+                                extent=extent,
+                            )
+                            ax.set_title(
+                                f"{var_name} update ({units_map.get(var_name, '')})",
+                                fontsize=10,
+                            )
+                            ax.set_xlabel("lon")
+                            ax.set_ylabel("lat")
+                            ax.tick_params(labelsize=8)
+                            fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+
+                        legend_text = (
+                            "IC update = learning_rate × filtered_gradient × ocean_mask\n"
+                            f"Color shows the {update_kind} correction in physical units."
+                        )
+                        fig.text(
+                            0.01,
+                            0.005,
+                            legend_text,
+                            fontsize=8,
+                            color="black",
+                            bbox=dict(facecolor="white", alpha=0.75, pad=3, edgecolor="none"),
+                        )
+
+                        fig.canvas.draw()
+                        img_buf = _np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+                        self.writer.add_image(
+                            image_tag, img_buf, iteration, dataformats="HWC"
+                        )
                     except Exception:
-                        pass
+                        # Fallback: normalized raster if plotting fails.
+                        update_np = update_image.detach().cpu().numpy()
+                        for ch_idx, var_name in enumerate(var_names):
+                            ch_arr = update_np[ch_idx]
+                            ch_abs = float(_np.nanmax(_np.abs(ch_arr)))
+                            if not _np.isfinite(ch_abs) or ch_abs == 0.0:
+                                ch_abs = 1.0
+                            norm_ch = ((ch_arr / (2.0 * ch_abs)) + 0.5).clip(0.0, 1.0)
+                            self.writer.add_image(
+                                f"{image_tag}/{var_name}",
+                                norm_ch[None, :, :],
+                                iteration,
+                                dataformats="CHW",
+                            )
+                    finally:
+                        plt.close("all")
 
     def _log_histograms_to_tensorboard(
         self,
@@ -783,18 +812,24 @@ class ICOptimizer:
             img = field[ch_idx]
             mask = ocean_mask[ch_idx].to(img)
 
-            channel_sq = 0.0
+            amplitude_sq = float((img.pow(2) * mask).sum().item())
+            finite_difference_sq = 0.0
 
             if img.shape[1] > 1:
                 gx = img[:, 1:] - img[:, :-1]
                 gx_mask = mask[:, 1:] * mask[:, :-1]
-                channel_sq += float((gx.pow(2) * gx_mask).sum().item())
+                finite_difference_sq += float((gx.pow(2) * gx_mask).sum().item())
 
             if img.shape[0] > 1:
                 gy = img[1:, :] - img[:-1, :]
                 gy_mask = mask[1:, :] * mask[:-1, :]
-                channel_sq += float((gy.pow(2) * gy_mask).sum().item())
+                finite_difference_sq += float((gy.pow(2) * gy_mask).sum().item())
 
+            # Divide by the field amplitude so uniformly scaling an update does
+            # not change its pixelization score.
+            channel_sq = (
+                finite_difference_sq / amplitude_sq if amplitude_sq > 0.0 else 0.0
+            )
             per_channel[var_name] = float(np.sqrt(channel_sq))
             total_sq += channel_sq
 
