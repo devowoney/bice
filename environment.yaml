@@ -36,6 +36,7 @@ dependencies:
   - pip
   - pip:
       - hydra-core
+      - hydra-joblib-launcher
       - omegaconf
       - tqdm
       - einops
