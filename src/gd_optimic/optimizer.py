@@ -467,9 +467,9 @@ class ICOptimizer:
                 "iteration": iteration + 1,
                 "loss": loss.item(),
                 "kernel_size": current_kernel,
-                "per_variable_loss": {
+                "weighted_per_variable_loss": {
                     k: v.mean().item() if torch.is_tensor(v) else v
-                    for k, v in loss_details["per_variable"].items()
+                    for k, v in loss_details["weighted_per_variable"].items()
                 },
                 "rmse_global": metrics["rmse_global"],
                 "ic_rmse": metrics["ic_rmse"],

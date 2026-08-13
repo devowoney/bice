@@ -264,8 +264,17 @@ class ObservationLoss:
             nmse_per_step, nloss_sum_intime, nloss_mean_intime, total_nloss = \
                 self.compute_normalized_mse(predictions, targets)
             
-            per_var_losses = self.compute_per_variable_loss(predictions, targets)
-            
+            # per_var_losses = self.compute_per_variable_loss(predictions, targets)
+            wloss = weights * nloss_sum_intime
+            wloss_dict = {
+                'total': wloss.sum(dim=1),  # [B] - total loss
+                'ssh': wloss[:, 0],  # [B] - SSH loss
+                'sst': wloss[:, 1],  # [B] - Temperature (SST) loss
+                'sss': wloss[:, 2],  # [B] - Salinity (SSS) loss
+                'uo': wloss[:, 3],  # [B] - Eastward velocity loss
+                'vo': wloss[:, 4],  # [B] - Northward velocity loss
+            }
+                        
             details = {
                 'loss': loss.item(),
                 'nmse_per_step': nmse_per_step,  # [B, T, C]
@@ -273,7 +282,7 @@ class ObservationLoss:
                 'nloss_mean_intime': nloss_mean_intime,  # [B, C]
                 'total_nloss': total_nloss,  # [B]
                 'weights': weights,  # [B, C]
-                'per_variable': per_var_losses,  # Dict
+                'weighted_per_variable': wloss_dict  # Dict
             }
             
             return loss, details
