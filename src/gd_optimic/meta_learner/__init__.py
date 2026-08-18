@@ -9,9 +9,11 @@ Meta-loop: θ ← θ - α_meta·∇_θ L_meta
 
 from .network_s import UNetMetaGrad2D, NetworkSConfig
 from .bilevel_optimizer import BiLevelICOptimizer
+from .checkpoint_manager import MetaLearnerCheckpointManager
 
 __all__ = [
     "UNetMetaGrad2D",
     "NetworkSConfig", 
     "BiLevelICOptimizer",
+    "MetaLearnerCheckpointManager",
 ]

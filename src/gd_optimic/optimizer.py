@@ -34,7 +34,7 @@ from .loss import ObservationLoss
 from .gradient import GradientFilter, ScheduledPooling
 from .metrics import MetricsComputer
 from .output_handler import OutputHandler
-from .meta_learner import BiLevelICOptimizer, UNetMetaGrad2D, NetworkSConfig
+from .meta_learner import BiLevelICOptimizer, UNetMetaGrad2D, NetworkSConfig, MetaLearnerCheckpointManager
 import xarray as xr
 
 
@@ -151,6 +151,7 @@ class ICOptimizer:
         self.use_meta_learner = use_meta_learner
         self.meta_learner = None
         self.meta_learner_config = meta_learner_config or {}
+        self.checkpoint_manager = None  # Will be initialized in optimize()
         if self.use_meta_learner:
             logger.info("Meta-learner (Phase P) is ENABLED")
             # BiLevelICOptimizer will be instantiated in optimize() once we know the IC shape
@@ -275,6 +276,55 @@ class ICOptimizer:
             logger.info(f"--------------------------------------------")
             logger.info(f"UNetMetaGrad2D parameters: {network_s.get_parameter_count():,}")
             logger.info(f"--------------------------------------------")
+            
+            # Initialize checkpoint manager
+            self.checkpoint_manager = MetaLearnerCheckpointManager(
+                checkpoint_dir=self.checkpoint_dir,
+                device=self.device
+            )
+            
+            # Handle meta-learner mode selection (training, fine-tuning, inference)
+            meta_learner_mode = self.meta_learner_config.get('mode', 'training')
+            load_checkpoint = self.meta_learner_config.get('load_checkpoint')
+            
+            logger.info(f"Meta-learner mode: {meta_learner_mode}")
+            
+            if meta_learner_mode == 'training':
+                logger.info("Training meta-learner from scratch")
+                # Network initialized with random weights above
+                
+            elif meta_learner_mode == 'fine_tune':
+                logger.info("Fine-tuning meta-learner from pre-trained checkpoint")
+                
+                if load_checkpoint:
+                    # Load checkpoint from explicit path
+                    checkpoint_info = self.checkpoint_manager.load_meta_learner(
+                        network_s, None, checkpoint_path=load_checkpoint
+                    )
+                    logger.info(f"Loaded checkpoint from {load_checkpoint}")
+                else:
+                    logger.warning("No checkpoint specified for fine-tuning. Starting from scratch.")
+                
+                # Unfreeze for fine-tuning
+                self.checkpoint_manager.unfreeze_meta_learner(network_s)
+                
+            elif meta_learner_mode == 'inference':
+                logger.info("Loading pre-trained meta-learner for inference (frozen)")
+                
+                if load_checkpoint:
+                    # Load checkpoint from explicit path
+                    checkpoint_info = self.checkpoint_manager.load_meta_learner(
+                        network_s, None, checkpoint_path=load_checkpoint
+                    )
+                    logger.info(f"Loaded checkpoint from {load_checkpoint}")
+                else:
+                    logger.warning("No checkpoint specified for inference. Using scratch weights (unfrozen).")
+                
+                # Freeze for inference
+                self.checkpoint_manager.freeze_meta_learner(network_s)
+                
+            else:
+                raise ValueError(f"Unknown meta-learner mode: {meta_learner_mode}. Must be 'training', 'fine_tune', or 'inference'.")
             
             # Instantiate BiLevelICOptimizer
             # BiLevelICOptimizer signature: (network_s, ocean_mask, device='cuda', config=None)
@@ -516,6 +566,16 @@ class ICOptimizer:
             # Save checkpoint
             if (iteration + 1) % self.save_frequency == 0:
                 self._save_checkpoint(iteration + 1, x0_current, y_hat_steps)
+                
+                # Save meta-learner checkpoint if enabled
+                if self.use_meta_learner and self.meta_learner is not None:
+                    self.checkpoint_manager.save_meta_learner(
+                        network_s=self.meta_learner.network_s,
+                        meta_optimizer=self.meta_learner.meta_optimizer,
+                        iteration=iteration + 1,
+                        meta_loss=self.meta_learner.loss_history[-1] if self.meta_learner.loss_history else float('inf'),
+                        meta_loss_history=self.meta_learner.loss_history,
+                    )
 
             # Memory cleanup
             del y_hat_steps, loss, gradients, filtered_gradients, masked_gradients

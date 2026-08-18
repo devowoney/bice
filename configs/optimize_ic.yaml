@@ -88,6 +88,17 @@ optimization:
   use_meta_learner: false  # Set to true to enable bi-level meta-learning
   
   meta_learner:
+    # Execution mode: 'training', 'fine_tune', or 'inference'
+    mode: "training"  # Options:
+                       # - 'training': Train meta-learner from scratch
+                       # - 'fine_tune': Load pre-trained and fine-tune
+                       # - 'inference': Load pre-trained, freeze meta-learner
+    
+    # Checkpoint loading (optional, used in fine_tune and inference modes)
+    load_checkpoint: null  # Checkpoint path to load. Options:
+                           # null: Don't load (start from random initialization)
+                           # "/path/to/meta_learner_iterX.pt": Load checkpoint from previous run
+    
     # NetworkS (UNet) architecture
     base_channels: 32        # Base channel count for UNet encoder
     num_groups: 8            # GroupNorm parameter groups
