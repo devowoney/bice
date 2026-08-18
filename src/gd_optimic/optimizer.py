@@ -277,6 +277,21 @@ class ICOptimizer:
             logger.info(f"UNetMetaGrad2D parameters: {network_s.get_parameter_count():,}")
             logger.info(f"--------------------------------------------")
             
+            # Instantiate BiLevelICOptimizer
+            # BiLevelICOptimizer signature: (network_s, ocean_mask, device='cuda', config=None)
+            # Pass forward_model and loss_fn so meta-learner can recompute loss inside meta loop
+            self.meta_learner = BiLevelICOptimizer(
+                network_s,
+                ocean_mask,
+                forward_model=self.forward_model,
+                loss_fn=self.loss_fn,
+                num_forecast_steps=num_forecast_steps,
+                device=self.device,
+                config=self.meta_learner_config,
+                writer=self.writer,
+            )
+            logger.info("  BiLevelICOptimizer initialized successfully\n")
+
             # Initialize checkpoint manager
             self.checkpoint_manager = MetaLearnerCheckpointManager(
                 checkpoint_dir=self.checkpoint_dir,
@@ -299,7 +314,7 @@ class ICOptimizer:
                 if load_checkpoint:
                     # Load checkpoint from explicit path
                     checkpoint_info = self.checkpoint_manager.load_meta_learner(
-                        network_s, None, checkpoint_path=load_checkpoint
+                        network_s, meta_optimizer=self.meta_learner.meta_optimizer, checkpoint_path=load_checkpoint
                     )
                     logger.info(f"Loaded checkpoint from {load_checkpoint}")
                 else:
@@ -314,7 +329,7 @@ class ICOptimizer:
                 if load_checkpoint:
                     # Load checkpoint from explicit path
                     checkpoint_info = self.checkpoint_manager.load_meta_learner(
-                        network_s, None, checkpoint_path=load_checkpoint
+                        network_s, meta_optimizer=self.meta_learner.meta_optimizer, checkpoint_path=load_checkpoint
                     )
                     logger.info(f"Loaded checkpoint from {load_checkpoint}")
                 else:
@@ -324,22 +339,7 @@ class ICOptimizer:
                 self.checkpoint_manager.freeze_meta_learner(network_s)
                 
             else:
-                raise ValueError(f"Unknown meta-learner mode: {meta_learner_mode}. Must be 'training', 'fine_tune', or 'inference'.")
-            
-            # Instantiate BiLevelICOptimizer
-            # BiLevelICOptimizer signature: (network_s, ocean_mask, device='cuda', config=None)
-            # Pass forward_model and loss_fn so meta-learner can recompute loss inside meta loop
-            self.meta_learner = BiLevelICOptimizer(
-                network_s,
-                ocean_mask,
-                forward_model=self.forward_model,
-                loss_fn=self.loss_fn,
-                num_forecast_steps=num_forecast_steps,
-                device=self.device,
-                config=self.meta_learner_config,
-                writer=self.writer,
-            )
-            logger.info("  BiLevelICOptimizer initialized successfully\n")
+                raise ValueError(f"Unknown meta mode: {meta_learner_mode}. Must be 'training', 'fine_tune', or 'inference'.")
 
             # Track meta-learning metrics in history
             self._j_prev = None
@@ -354,7 +354,8 @@ class ICOptimizer:
         if self.use_meta_learner:
             logger.info(f"Meta-learner: ENABLED (Phase P - Bi-level optimization)")
             logger.info(f"  Two-phase curriculum learning:")
-            logger.info(f"  - ALIGN phase (first {self.meta_learner_config.get('grad_align_steps', 6)} steps): Learn gradient-aligned patterns")
+            logger.info(f"  - ALIGN phase (first {self.meta_learner_config.get('grad_align_steps', 6)} steps) "
+                        f"Learn gradient-aligned patterns")
             logger.info(f"  - PERF phase (remaining steps): Maximize loss reduction")
             logger.info(f"  Configuration:")
             logger.info(f"    * Meta LR: {self.meta_learner_config.get('meta_lr', 1e-3)}")

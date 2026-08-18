@@ -219,3 +219,27 @@
 - Added a finite-difference IC update norm for the correction field in `src/gd_optimic/optimizer.py`.
 - TensorBoard logs `metrics/gradient/finite_difference_ic_update/{total,per_channel}` from the last IC update field.
 
+## 2026-08-17 — Feature 1: Meta-learner Checkpointing & Mode Selection — IMPLEMENTED ✅
+
+- **New Module:** `src/gd_optimic/meta_learner/checkpoint_manager.py`
+  - `MetaLearnerCheckpointManager` class for save/load meta-learner weights
+  - Checkpoint versioning and automatic discovery
+  - Freeze/unfreeze utilities for inference mode
+
+- **Three Operating Modes:**
+  1. **Training** (`mode: "training"`): Train from scratch (random init, all params trainable)
+  2. **Fine-tuning** (`mode: "fine_tune"`): Load pre-trained checkpoint and continue training (unfrozen params)
+  3. **Inference** (`mode: "inference"`): Load pre-trained checkpoint, freeze all meta-learner params (read-only)
+
+- **Configuration:**
+  - `mode`: Execution mode (training/fine_tune/inference)
+  - `load_checkpoint`: Checkpoint path (null for scratch, explicit path for loading)
+  - Path format: `.tmp/runs/{exp_id}_{timestamp}/checkpoints/meta_learner/meta_learner_iterX.pt`
+
+- **Files Modified:**
+  - `src/gd_optimic/meta_learner/__init__.py`: Export MetaLearnerCheckpointManager
+  - `src/gd_optimic/optimizer.py`: Instantiate checkpoint manager, handle mode selection, save meta-learner checkpoints
+  - `configs/optimize_ic.yaml`: Add mode and load_checkpoint parameters
+
+- **Status:** Feature 1 complete ✅ | Ready for testing and git commit
+
