@@ -78,6 +78,12 @@ loss:
     - 1.0  # S
     - 1.0  # U
     - 1.0  # V
+  
+  # Feature 2: Structural Consistency Loss
+  use_structural_loss: false  # Enable structure consistency term J_struct
+  structural_operator: "gradient"  # Operator type: 'gradient' (∇) or 'laplacian' (∇²)
+  structural_loss_weight: 0.01  # Weight for J_struct term (typical range: 0.01-0.1)
+                                 # Total loss: L = J_obs + weight_struct * J_struct
 
 # Optimization configuration
 optimization:

@@ -221,10 +221,15 @@ def main(cfg: DictConfig):
         obs_mask=obs_mask,
         loss_weighting=cfg.loss.weighting,
         manual_weights=cfg.loss.manual_weights if cfg.loss.weighting == 'manual' else None,
+        use_structural_loss=cfg.loss.use_structural_loss,
+        structural_operator=cfg.loss.structural_operator,
+        structural_loss_weight=cfg.loss.structural_loss_weight,
         device=device
     )
     
     logger.info(f"Initialized loss function (weighting: {cfg.loss.weighting})")
+    if cfg.loss.use_structural_loss:
+        logger.info(f"  - Structural loss enabled: operator={cfg.loss.structural_operator}, weight={cfg.loss.structural_loss_weight}")
     
     # -------------------------------------------------------------------------
     # 7. Initialize Gradient Filter

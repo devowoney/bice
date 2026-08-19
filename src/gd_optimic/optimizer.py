@@ -651,6 +651,16 @@ class ICOptimizer:
         self.writer.add_scalar("loss/J_obs/UO", per_var["uo"].mean().item(), iteration)
         self.writer.add_scalar("loss/J_obs/VO", per_var["vo"].mean().item(), iteration)
 
+        # Structural loss metrics (per-variable) if enabled
+        if "struct_mse_per_var_weighted" in loss_details:
+            struct_per_var = loss_details["struct_mse_per_var_weighted"]
+            self.writer.add_scalar("loss/S_loss/total", struct_per_var["total"].mean().item(), iteration)
+            self.writer.add_scalar("loss/S_loss/SSH", struct_per_var["ssh"].mean().item(), iteration)
+            self.writer.add_scalar("loss/S_loss/SST", struct_per_var["sst"].mean().item(), iteration)
+            self.writer.add_scalar("loss/S_loss/SSS", struct_per_var["sss"].mean().item(), iteration)
+            self.writer.add_scalar("loss/S_loss/UO", struct_per_var["uo"].mean().item(), iteration)
+            self.writer.add_scalar("loss/S_loss/VO", struct_per_var["vo"].mean().item(), iteration)
+
         # RMSE metrics (global)
         for var, rmse in metrics["rmse_global"].items():
             self.writer.add_scalar(f"metrics/rmse/global/{var}", rmse, iteration)

@@ -3,14 +3,17 @@ Loss computation for IC optimization.
 
 Provides:
     - ObservationLoss: MSE loss with observation masking
+    - Combined loss with optional structural consistency term
     
 Phase 1 scope: J_obs only (observation term).
+Phase 2: Add J_struct (structure consistency term) with optional operators.
 Phase 1.b will add J_b (background) and J_q (model error) terms.
 """
 
 import torch
 import torch.nn as nn
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
+from .structural_loss import StructureConsistencyLoss
 
 
 class ObservationLoss:
@@ -32,10 +35,13 @@ class ObservationLoss:
         obs_mask: torch.Tensor,
         loss_weighting: str = "dynamic",
         manual_weights: list = None,
+        use_structural_loss: bool = False,
+        structural_operator: str = "gradient",
+        structural_loss_weight: float = 0.01,
         device: str = "cuda"
     ):
         """
-        Initialize observation loss function.
+        Initialize observation loss function with optional structural consistency term.
         
         Args:
             obs_mask: Observation mask [T, C, H, W] - 1 where obs exist, 0 elsewhere
@@ -43,6 +49,9 @@ class ObservationLoss:
                 - 'dynamic': Automatically balance loss magnitudes across variables
                 - 'manual': Use user-specified weights
             manual_weights: Manual weights for each channel [SSH, T, S, U, V] if loss_weighting='manual'
+            use_structural_loss: Enable structural consistency loss term J_struct
+            structural_operator: Type of structural operator ('gradient' or 'laplacian')
+            structural_loss_weight: Weight for structural loss term (typical range: 0.01-0.1)
             device: PyTorch device ('cuda' or 'cpu')
         """
         self.obs_mask = obs_mask
@@ -52,6 +61,19 @@ class ObservationLoss:
         
         # MSE loss function
         self.mse_fn = nn.MSELoss(reduction='none')
+        
+        # Structural consistency loss (optional)
+        self.use_structural_loss = use_structural_loss
+        self.structural_loss_weight = structural_loss_weight
+        
+        if use_structural_loss:
+            self.structural_loss_fn = StructureConsistencyLoss(
+                operator_type=structural_operator,
+                obs_mask=obs_mask,
+                device=device
+            )
+        else:
+            self.structural_loss_fn = None
     
     def compute_mse_per_step(
         self,
@@ -167,12 +189,7 @@ class ObservationLoss:
         _, nloss_sum_intime, _, _ = self.compute_normalized_mse(predictions, targets)
         
         if self.loss_weighting == 'dynamic':
-            # Dynamic weights: balance loss magnitudes
-            # Larger loss → smaller weight (to prevent domination)
-            # This gives equal attention to all variables regardless of scale
-            
-            loss_mag = nloss_sum_intime.detach().abs() + 1e-10
-            weights = loss_mag.sum(dim=1, keepdim=True) / loss_mag  # [B, C]
+            weights = self._compute_dynamic_weights(nloss_sum_intime)
             
         elif self.loss_weighting == 'manual':
             # Manual weights from configuration
@@ -199,6 +216,12 @@ class ObservationLoss:
         weighted_loss = (weights * nloss_sum_intime).sum(dim=1)
         
         return weighted_loss, weights
+
+    @staticmethod
+    def _compute_dynamic_weights(loss_per_var: torch.Tensor) -> torch.Tensor:
+        """Compute inverse-magnitude weights from per-variable loss values."""
+        loss_mag = loss_per_var.detach().abs() + 1e-10
+        return loss_mag.sum(dim=1, keepdim=True) / loss_mag
     
     def compute_per_variable_loss(
         self,
@@ -242,7 +265,11 @@ class ObservationLoss:
         return_details: bool = False
     ) -> Tuple[torch.Tensor, Dict]:
         """
-        Forward pass: compute loss.
+        Forward pass: compute combined loss (observation + structural consistency).
+        
+        Total loss: L = J_obs + weight_struct * J_struct.
+        Manual weighting uses the configured weights for both terms. Dynamic
+        weighting is computed independently from each term's channel magnitudes.
         
         Args:
             predictions: Model predictions [B, T, C, H, W]
@@ -253,18 +280,49 @@ class ObservationLoss:
             loss: Scalar loss (for backprop)
             details: Dictionary with loss breakdown (if return_details=True)
         """
-        # Compute weighted loss
+        # Compute observation loss with weighting
         weighted_loss, weights = self.compute_weighted_loss(predictions, targets)
         
         # Take mean over batch
-        loss = weighted_loss.mean()
+        obs_loss = weighted_loss.mean()
+        
+        # Compute structural consistency loss if enabled
+        struct_loss_value = torch.tensor(0.0, device=obs_loss.device)
+        struct_loss_details = {}
+        struct_mse_per_var = None
+        struct_weights = None
+        
+        if self.use_structural_loss and self.structural_loss_fn is not None:
+            struct_loss_value, struct_loss_details = self.structural_loss_fn(
+                predictions,
+                targets,
+                weight=1.0
+            )
+            struct_mse_per_var = struct_loss_details.get('struct_mse_per_var', None)  # [B, C]
+            
+            if struct_mse_per_var is not None:
+                if self.loss_weighting == 'dynamic':
+                    # Structural dynamic weights must reflect structural loss
+                    # magnitudes, not observation loss magnitudes.
+                    struct_weights = self._compute_dynamic_weights(struct_mse_per_var)
+                else:
+                    # Manual weights are configured once and apply directly to
+                    # both observation and structural terms.
+                    struct_weights = weights
+
+                weighted_struct_per_var_for_loss = struct_mse_per_var * struct_weights  # [B, C]
+                # Aggregate over variables and apply structural loss weight
+                struct_loss_per_batch = weighted_struct_per_var_for_loss.sum(dim=1)  # [B]
+                struct_loss_value = (self.structural_loss_weight * struct_loss_per_batch).mean()
+        
+        # Total loss
+        total_loss = obs_loss + struct_loss_value
         
         if return_details:
             # Compute detailed breakdown for logging
             nmse_per_step, nloss_sum_intime, nloss_mean_intime, total_nloss = \
                 self.compute_normalized_mse(predictions, targets)
             
-            # per_var_losses = self.compute_per_variable_loss(predictions, targets)
             wloss = weights * nloss_sum_intime
             wloss_dict = {
                 'total': wloss.sum(dim=1),  # [B] - total loss
@@ -274,17 +332,46 @@ class ObservationLoss:
                 'uo': wloss[:, 3],  # [B] - Eastward velocity loss
                 'vo': wloss[:, 4],  # [B] - Northward velocity loss
             }
+            
+            # Compute per-variable structural loss if available
+            struct_loss_per_var_dict = {}
+            if struct_mse_per_var is not None:
+                # struct_mse_per_var shape: [B, C]
+                # Apply structural weighting and structural loss scaling.
+                weighted_by_var = struct_mse_per_var * struct_weights  # [B, C]
+                # Then: weight by structural loss scaling parameter
+                weighted_struct_per_var = weighted_by_var * self.structural_loss_weight
+                struct_loss_per_var_dict = {
+                    'total': weighted_struct_per_var.sum(dim=1),  # [B]
+                    'ssh': weighted_struct_per_var[:, 0],  # [B]
+                    'sst': weighted_struct_per_var[:, 1],  # [B]
+                    'sss': weighted_struct_per_var[:, 2],  # [B]
+                    'uo': weighted_struct_per_var[:, 3],  # [B]
+                    'vo': weighted_struct_per_var[:, 4],  # [B]
+                }
                         
             details = {
-                'loss': loss.item(),
+                'loss': total_loss.item(),
+                'obs_loss': obs_loss.item(),
                 'nmse_per_step': nmse_per_step,  # [B, T, C]
                 'nloss_sum_intime': nloss_sum_intime,  # [B, C]
                 'nloss_mean_intime': nloss_mean_intime,  # [B, C]
                 'total_nloss': total_nloss,  # [B]
                 'weights': weights,  # [B, C]
-                'weighted_per_variable': wloss_dict  # Dict
+                'weighted_per_variable': wloss_dict,  # Dict
             }
             
-            return loss, details
+            # Add structural loss details if enabled
+            if self.use_structural_loss:
+                details['struct_loss'] = struct_loss_value.item()
+                details['struct_loss_weight'] = self.structural_loss_weight
+                details['struct_weights'] = struct_weights  # [B, C]
+                details['struct_mse_per_var_weighted'] = struct_loss_per_var_dict  # Per-variable breakdown
+                details.update({
+                    f'struct_{k}': v for k, v in struct_loss_details.items()
+                    if k not in ['struct_mse_per_var']  # Exclude per_var as we already added it
+                })
+            
+            return total_loss, details
         else:
-            return loss, {}
+            return total_loss, {}

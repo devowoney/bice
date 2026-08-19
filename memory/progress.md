@@ -243,3 +243,107 @@
 
 - **Status:** Feature 1 complete ✅ | Ready for testing and git commit
 
+## 2026-08-18 — Feature 2: Structure Consistency Loss — IMPLEMENTED ✅
+
+- **New Module:** `src/gd_optimic/structural_loss.py`
+  - `StructuralOperator`: Base class for spatial derivative operators
+  - `GradientOperator`: First-order gradients (∇) — central difference stencils
+  - `LaplacianOperator`: Second-order Laplacian (∇²) — 4-neighbor curvature operator
+  - `StructureConsistencyLoss`: Main loss class combining operator + MSE with observation masking
+
+- **Loss Function Integration:**
+  - Total loss: `L = J_obs + λ_struct * J_struct`
+  - ObservationLoss now supports optional structural consistency term
+  - Combined loss computed in single forward pass
+
+- **Configuration Parameters:**
+  - `loss.use_structural_loss`: Boolean enable/disable (default: false)
+  - `loss.structural_operator`: "gradient" or "laplacian" (default: "gradient")
+  - `loss.structural_loss_weight`: Scaling factor (default: 0.01, typical range: 0.001–0.1)
+
+- **Files Modified:**
+  - `src/gd_optimic/loss.py`: Added structural loss integration to ObservationLoss class
+  - `src/gd_optimic/__init__.py`: Export all structural loss classes
+  - `configs/optimize_ic.yaml`: Add loss configuration parameters
+  - `src/run_optimization.py`: Pass structural loss params to ObservationLoss instantiation
+
+- **Implementation Details:**
+  - Gradient operator: Central difference on interior, replicate padding on boundaries
+  - Laplacian operator: 5-point Von Neumann stencil with replicate padding
+  - Both operators support [B, T, C, H, W] tensors with automatic batch processing
+  - Observation masking applied to structural loss same as observation loss
+
+- **Usage Examples:**
+  - `python run_optimization.py loss.use_structural_loss=true loss.structural_operator=gradient loss.structural_loss_weight=0.01`
+  - `python run_optimization.py loss.use_structural_loss=true loss.structural_operator=laplacian loss.structural_loss_weight=0.02`
+
+- **Documentation:** Created `FEATURE_2_DOCUMENTATION.md` and `FEATURE_2_SUMMARY.md`
+
+- **Status:** Feature 2 core implementation complete ✅ | Awaiting TensorBoard logging enhancements
+
+## 2026-08-19 — Feature 2: TensorBoard Logging Enhancements — COMPLETE ✅
+
+- **Gradient Channel Combination Algorithm:**
+  - Gradient operator outputs [B, T, 2*C, H, W] (∂f/∂x and ∂f/∂y concatenated)
+  - Implemented RMS combination to recover per-variable losses: `mag(∇f) = √(∂f/∂x)² + (∂f/∂y)²`
+  - Returns struct_mse_per_var [B, C] with proper channel mapping back to original variables
+
+- **Per-Variable Structural Loss Logging:**
+  - New TensorBoard section: `loss/S_loss/{total,SSH,SST,SSS,UO,VO}`
+  - Mirrors J_obs logging structure for consistency
+  - Only appears when `use_structural_loss=true`
+  - Weighted by `structural_loss_weight` parameter
+
+- **Files Modified:**
+  - `src/gd_optimic/structural_loss.py`: Updated compute_structure_mse() to return per-variable losses
+  - `src/gd_optimic/loss.py`: Added struct_mse_per_var_weighted processing and details dict
+  - `src/gd_optimic/optimizer.py`: Added TensorBoard logging for S_loss per-variable metrics
+
+- **Documentation:** Created `FEATURE_2_LOGGING_ENHANCEMENTS.md`
+
+- **Status:** Feature 2 complete ✅ | All files compile successfully | Ready for integration testing
+
+
+## 2026-08-19 — Feature 2: Variable Weighting Applied to Structural Loss — COMPLETE ✅
+
+- **Problem Solved:**
+  - J_obs was weighted (manual or dynamic) but J_struct was unweighted
+  - Inconsistent variable importance across loss terms
+  
+- **Solution Implemented:**
+  - Apply same weighting scheme to structural loss: `J_struct_weighted = Σ_c w_c * struct_mse[c]`
+  - Both J_obs and J_struct now respect variable priorities
+  - Dynamic/manual weights flow automatically from loss configuration
+
+- **Implementation:**
+  - Updated `src/gd_optimic/loss.py` __call__() method
+  - Extract weights from compute_weighted_loss()
+  - Apply weights to struct_mse_per_var: `weighted_by_var = struct_mse_per_var * weights`
+  - Use weighted values for both loss computation and TensorBoard logging
+
+- **Total Loss Formula (Updated):**
+  ```
+  L_total = J_obs + λ_struct * J_struct
+  where both J_obs and J_struct use same variable weighting [w_SSH, w_SST, w_SSS, w_UO, w_VO]
+  ```
+
+- **Benefits:**
+  - Consistent variable balancing across both loss terms
+  - Dynamic weighting: emphasizes structural consistency where observations are reliable
+  - Manual weighting: encodes domain knowledge about variable importance
+  - Better-balanced optimization gradients
+
+- **Configuration:**
+  - No new parameters needed
+  - Automatic application via existing `loss.weighting` and `loss.manual_weights`
+  
+- **Documentation:** Created `FEATURE_2_WEIGHTING_ENHANCEMENT.md`
+
+- **Status:** Feature 2 fully complete ✅ | All files compile successfully | Ready for integration testing
+
+## 2026-08-19 — Feature 2: Separate Dynamic Structural Weighting — COMPLETE ✅
+
+- Manual weighting reuses the configured normalized channel weights directly for both `J_obs` and `J_struct`.
+- Dynamic weighting is recalculated independently for `J_struct` from `struct_mse_per_var` channel magnitudes using the same inverse-magnitude logic as `J_obs`.
+- TensorBoard `loss/S_loss/*` values now use the structural weights actually applied to the structural term.
+- Validation: `python3 -m py_compile src/gd_optimic/loss.py src/gd_optimic/structural_loss.py` passed.
