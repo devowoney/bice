@@ -236,7 +236,8 @@ def main(cfg: DictConfig):
     # -------------------------------------------------------------------------
     logger.info("Initializing gradient filter...")
     gradient_filter = GradientFilter(
-        filter_type=cfg.optimization.gradient_filter,
+        enable=cfg.optimization.use_gradient_smoothing,
+        downsampling_method=cfg.optimization.downsampling_method,
         device=device
     )
     
@@ -318,6 +319,7 @@ def main(cfg: DictConfig):
         forecast_horizon=cfg.data.forecast_horizon,
         use_meta_learner=cfg.optimization.get("use_meta_learner", False),
         meta_learner_config=dict(cfg.optimization.meta_learner) if cfg.optimization.get("use_meta_learner", False) else None,
+        downsampling_method=cfg.optimization.downsampling_method,
     )
      
     logger.info("Initialized optimizer")

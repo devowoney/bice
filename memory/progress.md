@@ -344,6 +344,35 @@
 ## 2026-08-19 — Feature 2: Separate Dynamic Structural Weighting — COMPLETE ✅
 
 - Manual weighting reuses the configured normalized channel weights directly for both `J_obs` and `J_struct`.
-- Dynamic weighting is recalculated independently for `J_struct` from `struct_mse_per_var` channel magnitudes using the same inverse-magnitude logic as `J_obs`.
+    - Dynamic weighting is recalculated independently for `J_struct` from `struct_mse_per_var` channel magnitudes using the same inverse-magnitude logic as `J_obs`.
 - TensorBoard `loss/S_loss/*` values now use the structural weights actually applied to the structural term.
 - Validation: `python3 -m py_compile src/gd_optimic/loss.py src/gd_optimic/structural_loss.py` passed.
+
+## 2026-08-24 — Feature 3: Downsampling Method Selection — IMPLEMENTED ✅
+
+- **New Capability:** Choose between average-pooling and Gaussian low-pass filter for gradient smoothing
+- **Problem Addressed:** User requested option to replace averaging-pooling with low-pass filter (better structure preservation)
+- **Note:** Multi-resolution coarse-grid optimization deferred (model is fixed resolution) — only downsampling operators implemented
+
+- **New Class:** `GaussianLowPassFilter` in `src/gd_optimic/gradient.py`
+  - Creates 2D Gaussian kernels dynamically
+  - Applies depthwise convolution for per-channel filtering
+  - Preserves spatial structure better than non-overlapping pooling
+  
+- **Updated GradientFilter:** Enhanced to support multiple downsampling methods
+  - `downsampling_method` parameter: 'average_pooling' or 'gaussian_lowpass'
+  - Backward compatible (defaults to 'average_pooling')
+
+- **Configuration Parameters (NEW):**
+  - `optimization.downsampling_method`: "average_pooling" or "gaussian_lowpass"
+
+- **Files Modified:**
+  - `src/gd_optimic/gradient.py`: Added GaussianLowPassFilter class, updated GradientFilter
+  - `src/gd_optimic/optimizer.py`: Added downsampling_method parameter and usage
+  - `configs/optimize_ic.yaml`: Added downsampling_method configuration
+  - `src/run_optimization.py`: Pass downsampling_method to GradientFilter and ICOptimizer
+
+- **Validation:** All Python files compile successfully ✅
+
+- **Status:** Feature 3 implementation complete ✅ | Ready for integration testing
+

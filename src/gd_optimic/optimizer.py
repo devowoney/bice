@@ -74,6 +74,7 @@ class ICOptimizer:
         forecast_horizon: int = 28,
         use_meta_learner: bool = False,
         meta_learner_config: Optional[Dict] = None,
+        downsampling_method: str = "average_pooling",
     ):
         """
         Initialize IC optimizer (standard gradient descent or meta-learning).
@@ -134,6 +135,7 @@ class ICOptimizer:
         self.histogram_frequency = histogram_frequency
         self.scheduled_pooling = scheduled_pooling
         self.forecast_horizon = forecast_horizon
+        self.downsampling_method = downsampling_method
 
         # Tracking variables
         self.history = []
@@ -408,9 +410,7 @@ class ICOptimizer:
             # Apply gradient filtering
             filtered_gradients = self.gradient_filter(
                 gradients.detach(),
-                x0_current=x0_current,
-                x0_reference=x0_reference,
-                kernel_size=current_kernel,
+                kernel_size=current_kernel
             )
 
             # Apply ocean mask to gradients (zero out land gradients)

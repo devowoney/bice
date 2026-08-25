@@ -128,8 +128,11 @@ optimization:
     freeze_glonet: true      # Keep glonet weights frozen (A1)
     apply_ocean_mask: true   # Zero land regions in updates (A4)
   
-  # Gradient filtering
-  gradient_filter: "none"  # Options: 'none', 'weight', 'delta', 'pooling', 'pooling+weight'
+  # Gradient smoothing (spatial filtering for IC optimization)
+  use_gradient_smoothing: false  # Enable/disable gradient smoothing
+  downsampling_method: "average_pooling"  # Options: 'average_pooling', 'gaussian_lowpass'
+                                           # - 'average_pooling': Non-overlapping pooling (fast, simple)
+                                           # - 'gaussian_lowpass': Gaussian low-pass filter (better structure preservation)
   
   # Scheduled pooling (multigrid optimization)
   use_scheduled_pooling: false

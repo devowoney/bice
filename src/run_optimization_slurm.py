@@ -340,7 +340,11 @@ def main(cfg: DictConfig):
     # 7. Initialize Gradient Filter
     # -------------------------------------------------------------------------
     logger.info("Initializing gradient filter...")
-    gradient_filter = GradientFilter(filter_type=cfg.optimization.gradient_filter, device=device)
+    gradient_filter = GradientFilter(
+        enable=cfg.optimization.use_gradient_smoothing,
+        downsampling_method=cfg.optimization.downsampling_method,
+        device=device
+    )
 
     scheduled_pooling = None
     if cfg.optimization.use_scheduled_pooling:
