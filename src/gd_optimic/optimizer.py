@@ -446,7 +446,10 @@ class ICOptimizer:
             else:
                 # Meta-learner path: predict IC update without graph
                 with torch.no_grad():
-                    ic_update = self.meta_learner.predict_update(x0_current.detach()).requires_grad_(True)
+                    ic_update = self.meta_learner.predict_update(
+                        x0_current.detach(),
+                        target_gradient=masked_gradients,
+                    ).requires_grad_(True)
                     self._last_ic_update = ic_update.detach().cpu().clone()
                     x0_current = x0_current - ic_update
 

@@ -111,15 +111,17 @@ optimization:
     output_scale: 0.01       # Soft tanh damping scale
     
     # Meta-optimization
-    meta_lr: 1.0e-5          # Meta learning rate for NetworkS parameters
+    meta_lr: 1.0e-4          # Meta learning rate for NetworkS parameters
     num_meta_steps: 20       # Gradient steps per IC iteration (reduced from 10 to save memory)
     
     # Meta-loss weights
     grad_perf_steps: 10
     grad_trans_steps: 5
-    w_align: 1e0
-    w_perf: 1e1
-    lambda_reg: 1.0e-1       # L2 parameter regularization
+    align_lr_multiplier: 1.0  # Start conservatively; increase only after checking l_align
+    trans_lr_multiplier: 1.0  # Restore base meta learning rate in TRANS
+    w_align: 1e1
+    w_perf: 1e0
+    lambda_reg: 1.0e0        # L2 parameter regularization
     
     # Gradient management
     grad_clip_norm: 1.0      # Gradient clipping threshold
