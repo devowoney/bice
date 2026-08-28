@@ -384,7 +384,48 @@ class ICOptimizer:
             logger.info(f"Initial loss: {initial_loss.item():.6f}\n")
 
         # Main optimization loop
+        inference_mode = (
+            self.use_meta_learner
+            and self.meta_learner_config.get("mode", "training") == "inference"
+        )
         for iteration in range(self.num_iterations):
+            if inference_mode:
+                with torch.no_grad():
+                    x_outer_before = x0_current
+                    for _ in range(self.meta_learner_config.get("num_meta_steps", 10)):
+                        ic_update = self.meta_learner.predict_update(
+                            x0_current, inference=True
+                        )
+                        x0_current = x0_current - ic_update
+                    _, y_hat_steps = self.forward_model.forward(
+                        x0_current, num_forecast_steps
+                    )
+                    loss, loss_details = self.loss_fn(
+                        y_hat_steps, target_sequence, return_details=True
+                    )
+                    self._last_ic_update = (
+                        x_outer_before - x0_current
+                    ).cpu().clone()
+                    y_hat_final = y_hat_steps[:, -1, :, :, :]
+                    target_final = target_sequence[:, -1, :, :, :]
+                    metrics = self.metrics_computer.compute_all_metrics(
+                        y_hat_final, target_final, x0_current, x0_reference,
+                        regional_masks=regional_masks,
+                    )
+                self.history.append({
+                    "iteration": iteration + 1,
+                    "loss": loss.item(),
+                    "kernel_size": 1,
+                    "rmse_global": metrics["rmse_global"],
+                    "ic_rmse": metrics["ic_rmse"],
+                })
+                if loss.item() < self.best_loss:
+                    self.best_loss = loss.item()
+                    self.best_iteration = iteration + 1
+                    self.best_x0 = x0_current.detach().clone()
+                    self.best_predictions = y_hat_steps.detach().clone()
+                continue
+
             # Zero gradients
             if x0_current.grad is not None:
                 x0_current.grad.zero_()
@@ -444,38 +485,21 @@ class ICOptimizer:
                     # Ensure x0_current requires grad for next iteration
                     x0_current = x0_current.detach().requires_grad_(True)
             else:
-                # Meta-learner path: predict IC update without graph
-                with torch.no_grad():
-                    ic_update = self.meta_learner.predict_update(
-                        x0_current.detach(),
-                        target_gradient=masked_gradients,
-                    ).requires_grad_(True)
-                    self._last_ic_update = ic_update.detach().cpu().clone()
-                    x0_current = x0_current - ic_update
-
-                # Compute loss at new IC for meta-learner
-                with torch.no_grad():
-                    _, y_hat_steps_new = self.forward_model.forward(x0_current, num_forecast_steps)
-                    loss_current, _ = self.loss_fn(
-                        y_hat_steps_new, target_sequence, return_details=True
-                    )
-
-                # Initialize loss history on first iteration
-                if self._j_prev is None:
-                    self._j_prev = loss.item()
-
-                # Multi-step meta-optimization of network S parameters
+                # Train the meta-learner from the current outer-loop state.
                 self.meta_learner.target_sequence = target_sequence
+                x_outer_before = x0_current.detach()
                 meta_diags = self.meta_learner.step(
-                    first_update=ic_update,
                     x_current=x0_current,
-                    loss_prev=self._j_prev,
                     gradient_prev=masked_gradients,
                     iteration=iteration,
                 )
 
-                # Update loss history for next iteration
-                self._j_prev = float(loss_current.detach().cpu().item())
+                # Apply the final state produced by the inner loop.
+                x0_current = meta_diags.pop("_final_x").detach().requires_grad_(True)
+                self._last_ic_update = (x_outer_before - x0_current.detach()).cpu().clone()
+                self._j_prev = meta_diags.pop("_final_loss")
+                y_hat_steps = meta_diags.pop("_final_y_hat_steps")
+                loss = torch.as_tensor(self._j_prev, device=self.device)
 
                 # Extract meta-loss for logging
                 history_meta_loss = meta_diags.get("L_meta", None) if isinstance(meta_diags, dict) else None

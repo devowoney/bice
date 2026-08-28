@@ -119,6 +119,7 @@ optimization:
     grad_trans_steps: 5
     align_lr_multiplier: 1.0  # Start conservatively; increase only after checking l_align
     trans_lr_multiplier: 1.0  # Restore base meta learning rate in TRANS
+    perf_lr_multiplier: 1.0
     w_align: 1e1
     w_perf: 1e0
     lambda_reg: 1.0e0        # L2 parameter regularization

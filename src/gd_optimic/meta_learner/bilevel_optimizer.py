@@ -192,6 +192,7 @@ class BiLevelICOptimizer:
         self.num_meta_steps = config.get("num_meta_steps", 10)  # ← NEW: multiple meta updates per IC update
         self.align_lr_multiplier = float(config.get("align_lr_multiplier", 1.0))
         self.trans_lr_multiplier = float(config.get("trans_lr_multiplier", 1.0))
+        self.perf_lr_multiplier = float(config.get("perf_lr_multiplier", 1.0))
         self.meta_optimizer = optim.Adam(
             self.network_s.parameters(),
             lr=self.meta_lr,
@@ -215,9 +216,7 @@ class BiLevelICOptimizer:
 
     def step(
         self,
-        first_update: torch.Tensor,
         x_current: torch.Tensor,
-        loss_prev: torch.Tensor,
         gradient_prev: torch.Tensor,
         iteration: int = 0,
     ) -> Dict[str, float]:
@@ -248,12 +247,11 @@ class BiLevelICOptimizer:
         - Goal: Refine S to maximize actual loss reduction
         - Loss: w_perf * L_perf + l_reg
         - L_perf = loss_current = forecast error at updated IC
-        - Should see: L_perf DECREASING, improvement POSITIVE (IC updates work!)
+        - Should see: L_perf DECREASING (IC updates work!)
 
         Key metrics logged to TensorBoard:
         - L_align: Gradient alignment loss (should decrease in ALIGN phase)
         - L_perf: Forecast loss at updated IC (should decrease in PERF phase)
-        - improvement: loss_prev_step - loss_current (should be positive in PERF)
         - L_reg: Regularization term (should stay stable)
         - grad_norm: Gradient norm (for diagnostics)
 
@@ -266,11 +264,9 @@ class BiLevelICOptimizer:
 
         Args:
             x_current: [B, T, C, H, W] current IC state
-            loss_prev: scalar, forecast loss at x_current
             gradient_prev: [B, T, C, H, W] ∇_x loss, computed via backprop through forward_model
                 - Explicitly detached to avoid OOM during meta-optimization
                 - Represents the direction that reduces loss via gradient descent
-            first_update: [B, T, C, H, W] IC update for first meta-step
             iteration: Current outer loop iteration (for TensorBoard logging)
 
         Returns:
@@ -279,10 +275,8 @@ class BiLevelICOptimizer:
                 - L_perf: Forecast loss at updated IC
                 - L_meta: Combined meta-loss (used for backward pass)
                 - L_reg: L2 regularization penalty
-                - improvement: Loss reduction from previous step
         """
 
-        loss_prev = loss_prev.to(self.device) if torch.is_tensor(loss_prev) else torch.tensor(float(loss_prev), device=self.device)
         gradient_prev = gradient_prev.to(self.device).detach()
         gradient_mean, gradient_std = self._get_gradient_statistics(gradient_prev)
 
@@ -300,28 +294,25 @@ class BiLevelICOptimizer:
         last_l_perf = 0.0
         last_l_reg = 0.0
 
-        # Track loss from previous meta-step for improvement calculation
-        loss_prev_step = loss_prev
-
-        x_det = torch.zeros_like(x_current)
+        x_det = x_current.detach()
         for m in range(self.num_meta_steps):
             # Determine phase: ALIGN -> TRANS -> PERF.
             # grad_perf_steps is retained as the historical config key; it
             # represents the initial ALIGN-phase duration.
             if m < self.grad_perf_steps:
-                phase_name = "ALIGN"
+                phase_name = "PERF"
             elif m < self.grad_perf_steps + self.grad_trans_steps:
                 phase_name = "TRANS"
             else:
-                phase_name = "PERF"
+                phase_name = "ALIGN"
 
             # Adam is mostly invariant to multiplying the loss gradient.
             # Use an explicit phase-dependent learning rate when a larger
             # ALIGN update is desired.
             lr_multiplier = {
+                "PERF": self.perf_lr_multiplier,
                 "ALIGN": self.align_lr_multiplier,
                 "TRANS": self.trans_lr_multiplier,
-                "PERF": 1.0,
             }[phase_name]
             for group, base_lr in zip(self.meta_optimizer.param_groups, self._meta_base_lrs):
                 group["lr"] = base_lr * lr_multiplier
@@ -336,10 +327,6 @@ class BiLevelICOptimizer:
             # - No higher-order gradients through iterations
             # - Pure first-order gradient descent on meta-loss
 
-            if m == 0:
-                # First step: use the provided first_update
-                x_prev = (x_current + first_update)
-                x_det = x_prev.detach()  # Detach from previous iteration to avoid gradient accumulation
             # else:
             #     # Subsequent steps: predict new update and apply it
             #     # CRITICAL: Detach x_det so we don't propagate gradients through the entire trajectory
@@ -362,11 +349,6 @@ class BiLevelICOptimizer:
             # ============================================================================
             _, y_hat_steps_new = self.forward_model.forward(x_new, self.num_forecast_steps)
             loss_current, _ = self.loss_fn(y_hat_steps_new, self.target_sequence, return_details=True)
-
-            with torch.no_grad():
-                # Performance metric: improvement from PREVIOUS meta-step
-                # Positive = loss decreased (good), Negative = loss increased (bad)
-                improvement = loss_prev_step - loss_current
 
             # ============================================================================
             # STEP 3: Compute channel-standardized alignment loss
@@ -418,7 +400,7 @@ class BiLevelICOptimizer:
             elif phase_name == "TRANS":
                 # TRANS: Balance alignment and performance
                 # Goal: Smoothly transition from alignment focus to performance focus
-                l_meta = l_align_weighted + l_reg_weighted
+                l_meta = l_align_weighted + l_perf_weighted # l_reg_weighted
 
                 logger.debug(f"TRANS: l_meta={l_meta.item():.6f}")
 
@@ -449,8 +431,10 @@ class BiLevelICOptimizer:
             self.meta_optimizer.step()
 
             # Update state for next iteration
-            loss_prev_step = loss_current.detach()
             x_det = x_new.detach()
+            final_x = x_det
+            final_loss = float(loss_current.detach().cpu().item())
+            final_y_hat_steps = y_hat_steps_new.detach()
 
             # Cache loss values for logging
             last_l_combined = float(l_combined.detach().cpu().item())
@@ -477,7 +461,7 @@ class BiLevelICOptimizer:
             # Memory cleanup
             # del loss_current, l_reg_scalar, l_reg_standardized, l_reg_weighted
             del loss_current, l_reg_scalar, l_perf
-            del improvement, y_hat_steps_new, ic_update
+            del y_hat_steps_new, ic_update
             del x_new, l_align, l_align_weighted, l_combined, l_meta
 
             if torch.cuda.is_available():
@@ -489,6 +473,9 @@ class BiLevelICOptimizer:
             "L_perf": last_l_perf,
             "L_reg": last_l_reg,
             "num_meta_steps": self.num_meta_steps,
+            "_final_x": final_x,
+            "_final_loss": final_loss,
+            "_final_y_hat_steps": final_y_hat_steps,
         }
 
         return diagnostics
@@ -551,6 +538,7 @@ class BiLevelICOptimizer:
         gradient_mean: Optional[torch.Tensor] = None,
         gradient_std: Optional[torch.Tensor] = None,
         target_gradient: Optional[torch.Tensor] = None,
+        inference: bool = False,
     ) -> torch.Tensor:
         """
         Predict IC update using S(θ, x).
@@ -578,12 +566,17 @@ class BiLevelICOptimizer:
             gradient_mean, gradient_std = self._get_gradient_statistics(
                 target_gradient.to(self.device).detach()
             )
-        if gradient_mean is None or gradient_std is None:
+        if inference:
+            update = predicted_gradient_standardized * self._channel_scale(
+                predicted_gradient_standardized
+            )
+        elif gradient_mean is None or gradient_std is None:
             raise ValueError("gradient_mean and gradient_std are required to destandardize the prediction")
-        update = (
-            predicted_gradient_standardized * self._broadcast_channels(gradient_std, predicted_gradient_standardized)
-            + self._broadcast_channels(gradient_mean, predicted_gradient_standardized)
-        )
+        else:
+            update = (
+                predicted_gradient_standardized * self._broadcast_channels(gradient_std, predicted_gradient_standardized)
+                + self._broadcast_channels(gradient_mean, predicted_gradient_standardized)
+            )
 
         # Apply ocean mask: self.ocean_mask may be [C, H, W] or [1, C, H, W]
         if update.dim() == 5:
