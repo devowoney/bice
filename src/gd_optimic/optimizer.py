@@ -22,7 +22,6 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 from torch.utils.tensorboard import SummaryWriter
-import json
 from datetime import datetime
 import gc
 import logging
@@ -195,7 +194,11 @@ class ICOptimizer:
         self.writer = SummaryWriter(log_dir=str(self.tensorboard_dir))
         
         # Initialize output handler for NetCDF diagnostics
-        self.output_handler = OutputHandler(exp_dir=self.exp_dir, device=self.device)
+        self.output_handler = OutputHandler(
+            exp_dir=self.exp_dir,
+            device=self.device,
+            run_id=exp_id,
+        )
 
         logger.info(f"Output directory: {self.exp_dir}")
         logger.info(f"TensorBoard logs: {self.tensorboard_dir}")
@@ -1001,12 +1004,8 @@ class ICOptimizer:
             ground_truth_sequence: Full ground truth [B, T=forecast_horizon, C, H, W]
             ocean_mask: Ocean mask [C, H, W]
         """
-        # Save history as JSON to metrics/
-        history_path = self.metrics_dir / "optimization_history.json"
-        with open(history_path, "w") as f:
-            json.dump(results, f, indent=2)
-
-        logger.info(f"Saved history: {history_path}")
+        # Delegate metric artifact writing to the output handler.
+        self.output_handler.save_optimization_history(results)
 
         # Compute full forecasts for diagnostics (T=forecast_horizon)
         logger.info(f"Computing full forecast ({self.forecast_horizon} steps) for diagnostics...")

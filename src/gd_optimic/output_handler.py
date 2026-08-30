@@ -3,10 +3,12 @@ Output handler for IC optimization outputs.
 
 Provides:
     - Ocean state outputs in NetCDF (`states/`)
+    - Metrics and summaries in JSON/CSV (`metrics/`)
     - Diagnostic visualizations in PNG (`diagnostics/`)
     - RMSE/PSD comparison plots (reference vs optimized)
 """
 
+import csv
 import json
 import logging
 from pathlib import Path
@@ -26,6 +28,7 @@ class OutputHandler:
     Handles saving optimization outputs.
 
     - State files are saved as NetCDF in `states/`
+    - Metrics and summaries are saved in `metrics/`
     - Diagnostics are saved as PNG in `diagnostics/`
     """
     
@@ -37,8 +40,119 @@ class OutputHandler:
         3: ('U', 'm/s', 'Zonal Velocity'),
         4: ('V', 'm/s', 'Meridional Velocity'),
     }
+
+    def _compute_fixed_timestep_metrics(
+        self,
+        rmse_ref: np.ndarray,
+        rmse_opt: np.ndarray,
+        horizon: int,
+        var_names: list = None,
+    ) -> Dict:
+        if var_names is None:
+            var_names = [self.VAR_METADATA[i][0] for i in range(rmse_ref.shape[1])]
+        return {
+            f"t_{t}": {
+                var: {
+                    "reference": float(rmse_ref[t, idx]),
+                    "optimized": float(rmse_opt[t, idx]),
+                }
+                for idx, var in enumerate(var_names)
+            }
+            for t in range(7, horizon + 1, 7)
+        }
+
+    def _compute_horizontal_gain(
+        self,
+        rmse_ref: np.ndarray,
+        rmse_opt: np.ndarray,
+        observation_length: int,
+        var_names: list = None,
+    ) -> Dict:
+        """Measure optimized predictability beyond a reference persistence baseline."""
+        if var_names is None:
+            var_names = [self.VAR_METADATA[i][0] for i in range(rmse_ref.shape[1])]
+        horizon = rmse_ref.shape[0] - 1
+        boundary = min(max(int(observation_length), 0), horizon)
+        result = {}
+
+        for idx, var in enumerate(var_names):
+            baseline = float(rmse_ref[boundary, idx])
+            crossing = float("nan")
+            if np.isfinite(baseline) and np.isfinite(rmse_opt[boundary, idx]):
+                if rmse_opt[boundary, idx] >= baseline:
+                    crossing = float(boundary)
+                else:
+                    for t in range(boundary, horizon):
+                        y0, y1 = rmse_opt[t, idx], rmse_opt[t + 1, idx]
+                        if np.isfinite(y0) and np.isfinite(y1) and y0 < baseline <= y1:
+                            crossing = t + (baseline - y0) / (y1 - y0)
+                            break
+            gain = crossing - boundary if np.isfinite(crossing) else float("nan")
+            result[var] = {
+                "persistence_rmse_reference": baseline,
+                "persistence_timestep": float(boundary),
+                "reference_crossing_timestep": float(boundary),
+                "optimized_crossing_timestep": float(crossing),
+                "forecast_horizon": horizon,
+                "horizontal_gain_steps": float(gain),
+                "horizontal_gain_hours": float(gain * 6.0),
+                "gain_direction": (
+                    "optimized_predictability_gain"
+                    if np.isfinite(gain) and gain > 0
+                    else "no_gain_or_already_above_persistence"
+                ),
+            }
+        return result
+
+    def _save_metrics_to_csv_and_json(self, regional_summary: Dict, output_prefix: str = "rmse_metrics") -> None:
+        fixed_path = self.metrics_dir / f"{output_prefix}_fixed_timesteps.csv"
+        with open(fixed_path, "w", newline="") as f:
+            rows = (
+                {
+                    "region": region,
+                    "timestep": timestep,
+                    "variable": variable,
+                    "reference_rmse": values["reference"],
+                    "optimized_rmse": values["optimized"],
+                }
+                for region, data in regional_summary.items()
+                for timestep, metrics in data.get("rmse", {}).get("fixed_timestep_metrics", {}).items()
+                for variable, values in metrics.items()
+            )
+            writer = csv.DictWriter(
+                f, fieldnames=["region", "timestep", "variable", "reference_rmse", "optimized_rmse"]
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+        gain_path = self.metrics_dir / f"{output_prefix}_horizontal_gain.csv"
+        with open(gain_path, "w", newline="") as f:
+            fields = [
+                "region", "variable", "persistence_rmse_reference", "persistence_timestep",
+                "reference_crossing_timestep", "optimized_crossing_timestep", "forecast_horizon",
+                "horizontal_gain_steps", "horizontal_gain_hours", "gain_direction",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for region, data in regional_summary.items():
+                for variable, values in data.get("rmse", {}).get("horizontal_gain", {}).items():
+                    writer.writerow({"region": region, "variable": variable, **values})
+
+        summary = {
+            region: {
+                "final_rmse": {
+                    "reference": data.get("rmse", {}).get("reference", {}),
+                    "optimized": data.get("rmse", {}).get("optimized", {}),
+                },
+                "fixed_timestep_metrics": data.get("rmse", {}).get("fixed_timestep_metrics", {}),
+                "horizontal_gain": data.get("rmse", {}).get("horizontal_gain", {}),
+            }
+            for region, data in regional_summary.items()
+        }
+        with open(self.metrics_dir / f"{output_prefix}_summary.json", "w") as f:
+            json.dump(summary, f, indent=2)
     
-    def __init__(self, exp_dir: Path, device: str = 'cuda'):
+    def __init__(self, exp_dir: Path, device: str = 'cuda', run_id: Optional[str] = None):
         """
         Initialize output handler.
         
@@ -48,13 +162,106 @@ class OutputHandler:
         """
         self.exp_dir = Path(exp_dir)
         self.device = device
+        self.run_id = run_id or self.exp_dir.name or "current_run"
         
+        self.metrics_dir = self.exp_dir / "metrics"
+        self.metrics_dir.mkdir(parents=True, exist_ok=True)
+
         # Create diagnostics directory
         self.diagnostics_dir = self.exp_dir / "diagnostics"
         self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"Output handler initialized: {self.diagnostics_dir}")
-    
+
+    def save_optimization_history(self, results: Dict) -> Path:
+        """Save optimization history in the experiment metrics directory."""
+        history_path = self.metrics_dir / "optimization_history.json"
+        with open(history_path, "w") as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"Saved history: {history_path}")
+        return history_path
+
+    def _save_diagnostic_data_exports(self, summary: Dict) -> None:
+        """Persist complete regional RMSE and PSD curves for later multi-run analysis."""
+        rmse_path = self.metrics_dir / "rmse_evolution.json"
+        psd_path = self.metrics_dir / "psd_analysis.json"
+        with open(rmse_path, "w") as f:
+            json.dump(
+                {
+                    "run_id": self.run_id,
+                    "regions": {
+                        region: {
+                            "timesteps": data["rmse"].get("timesteps", []),
+                            "reference": data["rmse"].get("reference_series", {}),
+                            "optimized": data["rmse"].get("optimized_series", {}),
+                            "fixed_timestep_metrics": data["rmse"].get(
+                                "fixed_timestep_metrics", {}
+                            ),
+                            "horizontal_gain": data["rmse"].get("horizontal_gain", {}),
+                        }
+                        for region, data in summary.items()
+                    },
+                },
+                f,
+                indent=2,
+            )
+        with open(psd_path, "w") as f:
+            json.dump(
+                {
+                    "run_id": self.exp_dir.name,
+                    "regions": {
+                        region: data["psd"].get("curves", {})
+                        for region, data in summary.items()
+                    },
+                },
+                f,
+                indent=2,
+            )
+
+        with open(self.metrics_dir / "rmse_evolution.csv", "w", newline="") as f:
+            fields = ["run_id", "region", "timestep", "variable", "reference_rmse", "optimized_rmse"]
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            run_id = self.run_id
+            for region, data in summary.items():
+                rmse = data["rmse"]
+                timesteps = rmse.get("timesteps", [])
+                reference = rmse.get("reference_series", {})
+                optimized = rmse.get("optimized_series", {})
+                for idx, timestep in enumerate(timesteps):
+                    for variable in reference:
+                        writer.writerow({
+                            "run_id": run_id,
+                            "region": region,
+                            "timestep": timestep,
+                            "variable": variable,
+                            "reference_rmse": reference[variable][idx],
+                            "optimized_rmse": optimized[variable][idx],
+                        })
+
+        with open(self.metrics_dir / "psd_analysis.csv", "w", newline="") as f:
+            fields = ["run_id", "region", "variable", "wavenumber", "reference_psd",
+                      "optimized_psd", "ground_truth_psd"]
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            run_id = self.run_id
+            for region, curves in (
+                (region, data["psd"].get("curves", {}))
+                for region, data in summary.items()
+            ):
+                for variable, curve in curves.items():
+                    k_values = curve.get("wavenumber", [])
+                    for idx, wavenumber in enumerate(k_values):
+                        writer.writerow({
+                            "run_id": run_id,
+                            "region": region,
+                            "variable": variable,
+                            "wavenumber": wavenumber,
+                            "reference_psd": curve.get("reference", [])[idx],
+                            "optimized_psd": curve.get("optimized", [])[idx],
+                            "ground_truth_psd": curve.get("ground_truth", [])[idx],
+                        })
+
     def save_outputs(
         self,
         x0_init: torch.Tensor,
@@ -150,6 +357,7 @@ class OutputHandler:
                     input_sequence=input_sequence,
                     observation_length=int(target_sequence.shape[1]),
                 )
+                self._save_metrics_to_csv_and_json(regional_summary)
                 self._save_gulf_stream_animation(
                     state_dir=state_dir,
                     reference_forecast=reference_forecast,
@@ -178,7 +386,14 @@ class OutputHandler:
                             "ic_correction_anomaly_plot": "diagnostics/ic_correction_anomaly_comparison.png",
                             "regional_rmse_plot": "diagnostics/rmse_region_*.png",
                             "regional_psd_plot": "diagnostics/psd_region_*.png",
-                            "regional_metrics_json": "diagnostics/regional_metrics.json",
+                            "regional_metrics_json": "metrics/regional_metrics.json",
+                            "metrics_fixed_timesteps_csv": "metrics/rmse_metrics_fixed_timesteps.csv",
+                            "metrics_horizontal_gain_csv": "metrics/rmse_metrics_horizontal_gain.csv",
+                            "metrics_summary_json": "metrics/rmse_metrics_summary.json",
+                            "rmse_evolution_json": "metrics/rmse_evolution.json",
+                            "rmse_evolution_csv": "metrics/rmse_evolution.csv",
+                            "psd_analysis_json": "metrics/psd_analysis.json",
+                            "psd_analysis_csv": "metrics/psd_analysis.csv",
                             "forecast_animation": "states/forecast_comparison.gif",
                             "forecast_animation_anomaly": "states/forecast_comparison_anomaly.gif",
                             "gulf_stream_animation": "states/gulf_stream_forecast_comparison.gif",
@@ -909,13 +1124,53 @@ class OutputHandler:
             opt_series = _rmse_series(opt, gt, mask, init_arr=x0_opt)
             horizon = ref_series.shape[0] - 1
             step_axis = np.arange(horizon + 1)
+            fixed_ts_metrics = self._compute_fixed_timestep_metrics(
+                ref_series, opt_series, horizon, var_names
+            )
+            horizontal_gain_metrics = self._compute_horizontal_gain(
+                ref_series, opt_series, observation_length, var_names
+            )
             fig, axes = plt.subplots(5, 1, figsize=(12, 18), sharex=True)
             for ch_idx, ax in enumerate(axes):
                 var_name, units, long_name = self.VAR_METADATA[ch_idx]
                 ax.plot(step_axis, ref_series[:, ch_idx], color="tab:blue", linewidth=2, label="Reference")
                 ax.plot(step_axis, opt_series[:, ch_idx], color="tab:orange", linewidth=2, label="Optimized")
+                boundary_idx = min(max(int(observation_length), 0), horizon)
+                boundary_rmse = ref_series[boundary_idx, ch_idx]
+                crossing_idx = horizontal_gain_metrics[var_name]["optimized_crossing_timestep"]
+                ax.axhline(
+                    boundary_rmse,
+                    color="tab:blue",
+                    linestyle=":",
+                    linewidth=1.5,
+                    alpha=0.7,
+                    label="Reference persistence" if ch_idx == 0 else None,
+                )
+                ax.plot(boundary_idx, boundary_rmse, "bo", markersize=5, alpha=0.8)
+                if np.isfinite(crossing_idx):
+                    gain_steps = horizontal_gain_metrics[var_name]["horizontal_gain_steps"]
+                    ax.plot(
+                        [boundary_idx, crossing_idx],
+                        [boundary_rmse, boundary_rmse],
+                        color="tab:red",
+                        linestyle="--",
+                        linewidth=1.5,
+                        alpha=0.8,
+                        label="Predictability gain" if ch_idx == 0 else None,
+                    )
+                    ax.plot(crossing_idx, boundary_rmse, "ro", markersize=5, alpha=0.8)
+                    ax.annotate(
+                        f"Gain: {gain_steps:.2f} steps",
+                        xy=((boundary_idx + crossing_idx) / 2.0, boundary_rmse),
+                        xytext=(0, 8),
+                        textcoords="offset points",
+                        ha="center",
+                        fontsize=9,
+                        color="tab:red",
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.3),
+                    )
                 ax.axvline(
-                    observation_length + 0.5,
+                    boundary_idx,
                     color="k",
                     linestyle="--",
                     linewidth=1.2,
@@ -927,7 +1182,7 @@ class OutputHandler:
                 if ch_idx == 0:
                     ax.legend(loc="best")
             axes[-1].set_xlabel("Timestep (0=initial condition)")
-            fig.suptitle(f"RMSE Evolution | {region_name}", fontsize=13)
+            fig.suptitle(f"RMSE Evolution with Predictability Gain | {region_name}", fontsize=13)
             out_path = self.diagnostics_dir / f"rmse_region_{region_name}.png"
             fig.tight_layout(rect=[0, 0, 1, 0.98])
             fig.savefig(out_path, dpi=200)
@@ -936,11 +1191,21 @@ class OutputHandler:
                 "reference": {var: float(ref_series[-1, idx]) for idx, var in enumerate(var_names)},
                 "optimized": {var: float(opt_series[-1, idx]) for idx, var in enumerate(var_names)},
                 "file": str(out_path.relative_to(self.exp_dir)),
+                "timesteps": step_axis.tolist(),
+                "reference_series": {
+                    var: ref_series[:, idx].tolist() for idx, var in enumerate(var_names)
+                },
+                "optimized_series": {
+                    var: opt_series[:, idx].tolist() for idx, var in enumerate(var_names)
+                },
+                "fixed_timestep_metrics": fixed_ts_metrics,
+                "horizontal_gain": horizontal_gain_metrics,
             }
 
         def _save_psd_plot(region_name: str, mask: np.ndarray) -> Dict[str, Dict[str, float]]:
             fig, axes = plt.subplots(5, 1, figsize=(12, 18), sharex=True)
             summary = {"reference": {}, "optimized": {}, "ground_truth": {}}
+            curves = {}
             for ch_idx, ax in enumerate(axes):
                 var_name, _, long_name = self.VAR_METADATA[ch_idx]
                 k_ref, p_ref = _mean_psd(ref, mask, ch_idx)
@@ -955,6 +1220,12 @@ class OutputHandler:
                 if k_gt.size > 0:
                     ax.loglog(k_gt, p_gt + 1e-20, color="tab:green", linewidth=2, linestyle="--", label="Ground truth")
                     summary["ground_truth"][var_name] = _band_ratio(p_gt, k_gt)
+                curves[var_name] = {
+                    "wavenumber": k_ref.tolist() if k_ref.size > 0 else [],
+                    "reference": p_ref.tolist() if k_ref.size == p_ref.size else [],
+                    "optimized": p_opt.tolist() if k_ref.size == p_opt.size else [],
+                    "ground_truth": p_gt.tolist() if k_ref.size == p_gt.size else [],
+                }
                 ax.set_ylabel("PSD")
                 ax.set_title(f"{long_name} | {region_name}")
                 ax.grid(True, which="both", alpha=0.3)
@@ -967,6 +1238,7 @@ class OutputHandler:
             fig.savefig(out_path, dpi=200)
             plt.close(fig)
             summary["file"] = str(out_path.relative_to(self.exp_dir))
+            summary["curves"] = curves
             return summary
 
         summary = {}
@@ -977,10 +1249,11 @@ class OutputHandler:
                 "psd": _save_psd_plot(region_name, mask),
             }
 
-        reg_json = self.diagnostics_dir / "regional_metrics.json"
+        reg_json = self.metrics_dir / "regional_metrics.json"
         with open(reg_json, "w") as f:
             json.dump(summary, f, indent=2)
         logger.info(f"✓ Saved regional diagnostics: {reg_json}")
+        self._save_diagnostic_data_exports(summary)
         return summary
 
     def _save_gulf_stream_animation(
