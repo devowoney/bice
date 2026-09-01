@@ -543,3 +543,39 @@ class PSDComputer:
         band_ratio = mesoscale_energy / (total_energy + 1e-10)
         
         return float(band_ratio)
+
+    @staticmethod
+    def compute_ebcr(
+        psd_reference: np.ndarray,
+        psd_optimized: np.ndarray,
+        psd_truth: np.ndarray,
+        denominator_tolerance: float = 1e-12,
+    ) -> np.ndarray:
+        """
+        Compute the energy-bias correction ratio element-wise.
+
+        Values below zero indicate a bias sign flip, values from zero through
+        one indicate reduced bias, and values above one indicate increased bias.
+        Where the reference/truth bias is numerically zero, EBCR is undefined
+        and returned as NaN.
+        """
+        psd_reference = np.asarray(psd_reference, dtype=np.float64)
+        psd_optimized = np.asarray(psd_optimized, dtype=np.float64)
+        psd_truth = np.asarray(psd_truth, dtype=np.float64)
+        denominator = psd_reference - psd_truth
+        scale = max(
+            float(np.nanmax(np.abs(psd_reference))) if psd_reference.size else 0.0,
+            float(np.nanmax(np.abs(psd_truth))) if psd_truth.size else 0.0,
+            1.0,
+        )
+        ebcr = np.full(np.broadcast_shapes(
+            psd_reference.shape, psd_optimized.shape, psd_truth.shape
+        ), np.nan, dtype=np.float64)
+        valid = np.abs(denominator) > denominator_tolerance * scale
+        np.divide(
+            psd_optimized - psd_truth,
+            denominator,
+            out=ebcr,
+            where=valid,
+        )
+        return ebcr

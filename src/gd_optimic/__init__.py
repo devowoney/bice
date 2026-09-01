@@ -29,7 +29,7 @@ from .structural_loss import (
 )
 from .gradient import GradientFilter, ScheduledPooling
 from .optimizer import ICOptimizer
-from .metrics import MetricsComputer
+from .metrics import MetricsComputer, PSDComputer
 from .utils import MaskBuilder, ForwardModel
 from .output_handler import OutputHandler
 
@@ -45,6 +45,7 @@ __all__ = [
     "ScheduledPooling",
     "ICOptimizer",
     "MetricsComputer",
+    "PSDComputer",
     "MaskBuilder",
     "ForwardModel",
     "OutputHandler",
