@@ -347,16 +347,33 @@ class ForwardModel:
         def _rollout(x):
             # x: normalized input [B, T=2, C, H, W]
             y_hat_local = self.model(x)
-            y_hat_last_local = y_hat_local[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
-            y_hat_denorm_local = self.denormalizer(y_hat_last_local) * self.ocean_mask.unsqueeze(0)
+            
+            # Apply ocean mask if available
+            if self.ocean_mask is not None:
+                y_hat_last_local = y_hat_local[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
+                y_hat_denorm_local = self.denormalizer(y_hat_last_local) * self.ocean_mask.unsqueeze(0)
+            else:
+                y_hat_last_local = y_hat_local[:, -1, :, :, :]
+                y_hat_denorm_local = self.denormalizer(y_hat_last_local)
+            
             y_hat_steps_local = [y_hat_denorm_local]
             y_hat_local = torch.stack([x[:, -1, :, :, :], y_hat_last_local], dim=1)
 
             for _ in range(num_steps - 1):
-                y_hat_first_local = y_hat_local[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
+                if self.ocean_mask is not None:
+                    y_hat_first_local = y_hat_local[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
+                else:
+                    y_hat_first_local = y_hat_local[:, -1, :, :, :]
+                
                 y_hat_local = self.model(y_hat_local)
-                y_hat_last_local = y_hat_local[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
-                y_hat_denorm_local = self.denormalizer(y_hat_last_local) * self.ocean_mask.unsqueeze(0)
+                
+                if self.ocean_mask is not None:
+                    y_hat_last_local = y_hat_local[:, -1, :, :, :] * self.ocean_mask.unsqueeze(0)
+                    y_hat_denorm_local = self.denormalizer(y_hat_last_local) * self.ocean_mask.unsqueeze(0)
+                else:
+                    y_hat_last_local = y_hat_local[:, -1, :, :, :]
+                    y_hat_denorm_local = self.denormalizer(y_hat_last_local)
+                
                 y_hat_steps_local.append(y_hat_denorm_local)
                 y_hat_local = torch.stack([y_hat_first_local, y_hat_last_local], dim=1)
 

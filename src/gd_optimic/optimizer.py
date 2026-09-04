@@ -179,8 +179,7 @@ class ICOptimizer:
         self.exp_id = exp_id
 
         # Create experiment directory structure
-        # self.exp_dir = self.output_dir / exp_id
-        self.exp_dir = Path(".")
+        self.exp_dir = Path(self.output_dir) / exp_id
         self.checkpoint_dir = self.exp_dir / self.checkpoints_subdir
         self.metrics_dir = self.exp_dir / self.metrics_subdir
         self.tensorboard_dir = self.exp_dir / self.tensorboard_subdir
