@@ -1,13 +1,17 @@
 """
-Neural network S(θ, x) that learns to predict IC updates.
+Neural network S(θ, x) or S(θ, grad, k) that learns to predict IC updates.
 
 Architecture: UNet with skip connections for multi-scale feature extraction.
 
-Input: Current IC state [B, C, H, W] or [B, T, C, H, W]
+Two modes:
+1. meta_general_training=True: Input is raw IC state [B, C, H, W] or [B, T, C, H, W]
+2. meta_one_task=True: Input is gradient [B, C, H, W] or [B, T, C, H, W] + iteration k
+
 Output: Update direction (full step, no learning rate) [B, C, H, W] or [B, T, C, H, W]
 """
 
 from dataclasses import dataclass
+from typing import Union
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
@@ -15,9 +19,9 @@ from torch.utils.checkpoint import checkpoint
 
 @dataclass
 class NetworkSConfig:
-    """Configuration for S(θ, x) UNet network."""
+    """Configuration for S(θ, x) or S(θ, grad, k) UNet network."""
     
-    input_channels: int = 5  # SSH, T, S, U, V
+    input_channels: int = 5  # IC channels (SSH, T, S, U, V) or gradient channels
     output_channels: int = 5  # Same as input (spatial update)
     spatial_height: int = 330
     spatial_width: int = 360
@@ -28,6 +32,9 @@ class NetworkSConfig:
     
     # Temporal dimension (set to 1 for single-step, >1 for trajectory)
     temporal_steps: int = 1
+    
+    # Iteration embedding dimension (used when meta_one_task=True)
+    iteration_embedding_dim: int = 8
     
     # Output scaling
     output_scale: float = 0.01  # Damping factor to prevent explosive updates
@@ -51,12 +58,52 @@ class DoubleConv(nn.Module):
         return self.block(x)
 
 
+class IterationEmbedding(nn.Module):
+    """Embed iteration k into a vector for conditioning the network."""
+    
+    def __init__(self, embedding_dim: int = 8):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        # Use a small MLP to embed the iteration number
+        self.embedding = nn.Sequential(
+            nn.Linear(1, embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, embedding_dim)
+        )
+    
+    def forward(self, k: Union[int, torch.Tensor]) -> torch.Tensor:
+        """
+        Args:
+            k: Iteration number (scalar or 1D tensor)
+        Returns:
+            Embedding vector of shape [embedding_dim]
+        """
+        # Convert to tensor if it's an integer
+        if isinstance(k, int):
+            k = torch.tensor(k, dtype=torch.float32, device=self.embedding[0].weight.device)
+        
+        # Ensure k is 2D: [1, 1] for broadcasting
+        if k.dim() == 0:
+            k = k.unsqueeze(0).unsqueeze(0)
+        elif k.dim() == 1:
+            k = k.unsqueeze(1)
+        
+        # Pass through embedding network
+        k_float = k.float()
+        embedding = self.embedding(k_float)
+        return embedding
+
+
 class UNetMetaGrad2D(nn.Module):
     """
-    UNet-based update predictor: S(θ, x) → δx
+    UNet-based update predictor: S(θ, x) → δx or S(θ, grad, k) → δx
     
     Predicts the **full IC update** for one optimization step.
     Multi-scale feature extraction via encoder-decoder with skip connections.
+    
+    Two modes:
+    - meta_general_training=True: Takes IC state as input (original behavior)
+    - meta_one_task=True: Takes gradient + iteration as input
     
     Supports both single-step [B, C, H, W] and temporal [B, T, C, H, W] inputs.
     """
@@ -66,14 +113,20 @@ class UNetMetaGrad2D(nn.Module):
         self.cfg = cfg
         self.output_scale = cfg.output_scale
         
+        # Iteration embedding (used when meta_one_task=True)
+        self.iteration_embedding = IterationEmbedding(cfg.iteration_embedding_dim)
+        
         # Input channels accounting for temporal dimension
         in_ch = cfg.temporal_steps * cfg.input_channels
         out_ch = cfg.temporal_steps * cfg.output_channels
         b = cfg.base_channels
         groups = cfg.num_groups
         
-        # Encoder
-        self.enc1 = DoubleConv(in_ch, b, groups=groups)
+        # Additional channels for iteration embedding (broadcasted) when using gradient input
+        self.iteration_channels = cfg.iteration_embedding_dim
+        
+        # Encoder - expects max possible input channels (in_ch + iteration_channels)
+        self.enc1 = DoubleConv(in_ch + self.iteration_channels, b, groups=groups)
         self.pool1 = nn.MaxPool2d(2)
         
         self.enc2 = DoubleConv(b, b * 2, groups=groups)
@@ -108,13 +161,18 @@ class UNetMetaGrad2D(nn.Module):
         # Output head
         self.out_conv = nn.Conv2d(b, out_ch, kernel_size=1)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, k: Union[int, torch.Tensor] = None) -> torch.Tensor:
         """
-        Predict IC update.
+        Predict IC update from either IC state or gradient + iteration.
+        
+        Two modes:
+        1. meta_general_training=True: x is IC state [B, C, H, W] or [B, T, C, H, W]
+        2. meta_one_task=True: x is gradient [B, C, H, W] or [B, T, C, H, W], k is iteration
         
         Args:
-            x: [B, C, H, W] current IC state (single-step)
-               or [B, T, C, H, W] trajectory (multi-step)
+            x: [B, C, H, W] IC state or gradient tensor (single-step)
+               or [B, T, C, H, W] IC state or gradient trajectory (multi-step)
+            k: Iteration number (scalar or tensor). Required when meta_one_task=True.
         
         Returns:
             update: [B, C, H, W] or [B, T, C, H, W] predicted update
@@ -122,14 +180,39 @@ class UNetMetaGrad2D(nn.Module):
         # Handle temporal dimension if present
         if x.dim() == 5:
             B, T, C, H, W = x.shape
-            x = x.reshape(B, T * C, H, W)
+            x_reshaped = x.reshape(B, T * C, H, W)
             temporal_reshape = True
         else:
             B, C, H, W = x.shape
+            x_reshaped = x
             temporal_reshape = False
         
+        # If k is provided, we're in gradient input mode (meta_one_task=True)
+        if k is not None:
+            # Get iteration embedding
+            k_embedding = self.iteration_embedding(k)  # [1, iteration_embedding_dim]
+            
+            # Add iteration embedding as additional channels
+            # Broadcast k_embedding to match spatial dimensions
+            if x_reshaped.dim() == 4:
+                # [B, C, H, W] -> add iteration channels
+                k_broadcast = k_embedding.view(1, self.iteration_channels, 1, 1)
+                k_broadcast = k_broadcast.expand(B, -1, H, W)
+                x_with_k = torch.cat([x_reshaped, k_broadcast], dim=1)
+            else:
+                x_with_k = x_reshaped
+        else:
+            # Original mode: pad with zeros for iteration channels to match expected input size
+            if x_reshaped.dim() == 4:
+                # [B, C, H, W] -> pad to [B, C + iteration_channels, H, W]
+                padding = torch.zeros(B, self.iteration_channels, H, W, 
+                                    dtype=x_reshaped.dtype, device=x_reshaped.device)
+                x_with_k = torch.cat([x_reshaped, padding], dim=1)
+            else:
+                x_with_k = x_reshaped
+        
         # Encoder with skip connections
-        e1 = self.enc1(x)              # (B, b, H, W)
+        e1 = self.enc1(x_with_k)              # (B, b, H, W)
         p1 = self.pool1(e1)            # (B, b, H/2, W/2)
         
         # Apply checkpointing to large encoder blocks to save memory during higher-order grads

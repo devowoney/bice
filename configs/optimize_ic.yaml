@@ -101,14 +101,15 @@ loss:
 
 # Optimization configuration
 optimization:
-  learning_rate: 10
+  learning_rate: 1e-2
   num_iterations: 300
   
   # Meta-learner configuration (Phase P)
   use_meta_learner: false  # Set to true to enable bi-level meta-learning
   
   meta_learner:
-    # Execution mode: 'training', 'fine_tune', or 'inference'
+    meta_one_task: true
+    meta_general_training: false
     mode: "training"  # Options:
                        # - 'training': Train meta-learner from scratch
                        # - 'fine_tune': Load pre-trained and fine-tune
@@ -122,21 +123,21 @@ optimization:
     # NetworkS (UNet) architecture
     base_channels: 32        # Base channel count for UNet encoder
     num_groups: 8            # GroupNorm parameter groups
-    output_scale: 0.01       # Soft tanh damping scale
+    output_scale: 0.1        # Soft tanh damping scale (increased to allow larger updates)
     
     # Meta-optimization
-    meta_lr: 1.0e-4          # Meta learning rate for NetworkS parameters
-    num_meta_steps: 20       # Gradient steps per IC iteration (reduced from 10 to save memory)
+    meta_lr: 1.0e-3          # Meta learning rate for NetworkS parameters (increased for better learning)
+    num_meta_steps: 10       # Gradient steps per IC iteration (reduced to save computation)
     
     # Meta-loss weights
-    grad_perf_steps: 10
+    grad_align_steps: 10
     grad_trans_steps: 5
     align_lr_multiplier: 1.0  # Start conservatively; increase only after checking l_align
     trans_lr_multiplier: 1.0  # Restore base meta learning rate in TRANS
     perf_lr_multiplier: 1.0
-    w_align: 1e1
-    w_perf: 1e0
-    lambda_reg: 1.0e0        # L2 parameter regularization
+    w_align: 1.0             # More balanced alignment weight
+    w_perf: 1.0              # Performance weight
+    lambda_reg: 1e-4         # Reduced regularization for better learning
     
     # Gradient management
     grad_clip_norm: 1.0      # Gradient clipping threshold

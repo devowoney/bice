@@ -5,6 +5,10 @@ S(θ, x) learns to predict IC updates during the main optimization loop.
 
 Main loop: x^(k+1) = x^(k) + S(θ, x^(k))
 Meta-loop: θ ← θ - α_meta·∇_θ L_meta
+
+Supports two objectives:
+1. Objective 1 (gradient_input): Learn to accelerate gradient descent using gradient + iteration input
+2. Objective 2 (raw_field): Learn gradients from raw IC fields (original implementation)
 """
 
 from .network_s import UNetMetaGrad2D, NetworkSConfig
