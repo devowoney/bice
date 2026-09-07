@@ -1,14 +1,14 @@
-# Hydra configuration for IC optimization
-# This config manages all optimization parameters following R8 tracking conventions
+# Hydra configuration for IC optimization with Hybrid Meta-Learner Input
+# This config tests the hybrid input mode: IC + gradient + iteration
+# Based on optimize_ic.yaml with hybrid-specific modifications
 
 # Experiment metadata
 experiment:
-  name: "refIC_fullobs"  # Short name for experiment type
-  description: "Initial condition optimization with full observations (idealized twin)"
+  name: "hybridIC_fullobs"  # Hybrid meta-learner input mode
+  description: "Initial condition optimization with hybrid meta-learner input (IC + gradient + iteration)"
   timestamp: ${now:%Y-%m-%d_%H-%M-%S}  # Auto-generated at runtime
 
 #  Hydra output
-  #  Align output directory with main script
 hydra:
   run:
     dir: .tmp/runs/${experiment.name}_${experiment.timestamp}
@@ -18,7 +18,7 @@ hydra:
     chdir: true 
     name: ${experiment.name} 
 
-# Data configuration
+# Data configuration (same as base config)
 data:
   root_path: "/Odyssey/public/glonet"
   
@@ -47,26 +47,12 @@ data:
   observation_length: 7  # Number of observation time steps
   forecast_horizon: 28  # Total forecast horizon (7-day assimilation + 3-week forecast)
 
-# Model configuration
+# Model configuration (same as base config)
 model:
   location: "/Odyssey/public/glonet/TrainedWeights"
   checkpoint_files:
     part1: "glonet_part1.pth"  # Surface model (5 channels)
-  use_gradient_checkpointing: false  # Memory-efficient backprop (outer rollout-level wrap)
-
-  # Optional: per-block inner-checkpoint override inside GlonetGradientCheckpointing
-  # (only applies when use_gradient_checkpointing is true). Omit this whole section to
-  # keep the default of checkpointing all 4 blocks -- safe on any GPU size.
-  # Profiled on H200 (140GB), 7-step rollout, outer checkpoint on:
-  #   spatial:      true   # MUST stay true -- confirmed OOM if false
-  #   latent:       false  # safe to disable on high-memory GPUs: +~19GB peak, ~4% faster
-  #   temporal:     true   # MUST stay true -- confirmed OOM if false
-  #   predictions:  true   # only disable with extra memory margin: +~59GB peak, ~2.5% faster
-  inner_checkpoint_blocks:
-    spatial: true
-    latent: false
-    temporal: true
-    predictions: true
+  use_gradient_checkpointing: true  # Memory-efficient backprop
 
 # Observation configuration (A2-compliant)
 observations:
@@ -80,7 +66,7 @@ observations:
   sst_operator: "direct_pixel"      # Gridded L3 → direct pixel match
   qc_strategy: "light"              # Trust CMEMS L3 pre-filtering
 
-# Loss configuration
+# Loss configuration (same as base config)
 loss:
   weighting: "manual"  # Options: 'dynamic', 'manual'
                         # 'dynamic': Automatically balance loss magnitudes
@@ -104,13 +90,13 @@ optimization:
   learning_rate: 1e-2
   num_iterations: 300
   
-  # Meta-learner configuration (Phase P)
-  use_meta_learner: false  # Set to true to enable bi-level meta-learning
+  # Meta-learner configuration (Phase P) - HYBRID MODE ENABLED
+  use_meta_learner: true   # Enable bi-level meta-learning
   
   meta_learner:
     meta_one_task: true
     meta_general_training: false
-    hybrid_input: false  # Child flag of meta_one_task: combine IC + gradient + iteration
+    hybrid_input: true   # NEW: Hybrid mode - combine IC + gradient + iteration
     mode: "training"  # Options:
                        # - 'training': Train meta-learner from scratch
                        # - 'fine_tune': Load pre-trained and fine-tune
@@ -121,8 +107,8 @@ optimization:
                            # null: Don't load (start from random initialization)
                            # "/path/to/meta_learner_iterX.pt": Load checkpoint from previous run
     
-    # NetworkS (UNet) architecture
-    base_channels: 32        # Base channel count for UNet encoder (64 for hybrid mode)
+    # NetworkS (UNet) architecture - OPTIMIZED FOR HYBRID MODE
+    base_channels: 64        # Increased from 32 to handle 10+ input channels in hybrid mode
     num_groups: 8            # GroupNorm parameter groups
     output_scale: 0.1        # Soft tanh damping scale (increased to allow larger updates)
     
@@ -232,7 +218,7 @@ logging:
   save_frequency: 50           # Save checkpoint every N iterations
   
   # Experiment ID format: {exp_name}_{timestamp}
-  # Example: refIC_fullobs_2026-06-12_15-30-45
+  # Example: hybridIC_fullobs_2026-06-12_15-30-45
   auto_generate_exp_id: true
 
 # Compute configuration

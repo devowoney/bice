@@ -180,11 +180,20 @@ class BiLevelICOptimizer:
         # Mode flags
         self.meta_general_training = config.get("meta_general_training", True)  # Use raw IC input (original)
         self.meta_one_task = config.get("meta_one_task", False)  # Use gradient + iteration input
+        self.hybrid_input = config.get("hybrid_input", False)  # Use IC + gradient + iteration input (child of meta_one_task)
         
         # Validate mode flags
         if self.meta_general_training and self.meta_one_task:
             logger.warning("Both meta_general_training and meta_one_task are True. "
                          "meta_one_task will take precedence.")
+        
+        # hybrid_input validation: can only be True when meta_one_task is True
+        if self.hybrid_input and not self.meta_one_task:
+            raise ValueError("hybrid_input=True requires meta_one_task=True")
+        
+        # Override: If meta_one_task is False, force hybrid_input to False
+        if not self.meta_one_task:
+            self.hybrid_input = False
         
         # Curriculum: three-phase learning (only used when meta_general_training=True)
         self.grad_align_steps = config.get("grad_align_steps", 6)  # Number of initial meta-steps to focus on alignment
@@ -356,19 +365,42 @@ class BiLevelICOptimizer:
             #     # This is the natural gradient flow we want
 
             if self.meta_one_task:
-                # Standardize gradient
-                gradient_standardized = (
-                    gradient_prev - self._broadcast_channels(gradient_mean, gradient_prev)
+                if self.hybrid_input:
+                    # NEW: Hybrid mode - use IC + gradient + iteration
+                    # Standardize IC by IC statistics, gradient by gradient statistics
+                    x_standardized = (x_det - self._channel_offset(x_det)) / self._channel_scale(x_det)
+                    gradient_standardized = (
+                        gradient_prev - self._broadcast_channels(gradient_mean, gradient_prev)
                     ) / self._broadcast_channels(gradient_std, gradient_prev)
-                # Gradient input mode: pass gradient and iteration
-                ic_update_standardized = self.predict_update(
-                    gradient_standardized,  # Pass gradient instead of IC
-                    iteration=iteration,  # Pass iteration k
-                )
-                # Return in gradient field
-                ic_update = (
-                    ic_update_standardized * self._broadcast_channels(gradient_std, gradient_prev) 
-                    ) + self._broadcast_channels(gradient_mean, gradient_prev)
+                    
+                    # Concatenate IC and gradient along channel dimension: [B, T, 2*C, H, W]
+                    hybrid_input = torch.cat([x_standardized, gradient_standardized], dim=2)
+                    
+                    # Pass to network with iteration
+                    ic_update_standardized = self.predict_update(
+                        hybrid_input, 
+                        iteration=iteration,
+                    )
+                    
+                    # Destandardize using IC statistics (output is an IC update)
+                    ic_update = (
+                        ic_update_standardized * self._channel_scale(ic_update_standardized)
+                    ) + self._channel_offset(ic_update_standardized)
+                else:
+                    # EXISTING: Gradient-only mode
+                    # Standardize gradient
+                    gradient_standardized = (
+                        gradient_prev - self._broadcast_channels(gradient_mean, gradient_prev)
+                    ) / self._broadcast_channels(gradient_std, gradient_prev)
+                    # Gradient input mode: pass gradient and iteration
+                    ic_update_standardized = self.predict_update(
+                        gradient_standardized,  # Pass gradient instead of IC
+                        iteration=iteration,  # Pass iteration k
+                    )
+                    # Return in gradient field
+                    ic_update = (
+                        ic_update_standardized * self._broadcast_channels(gradient_std, gradient_prev) 
+                        ) + self._broadcast_channels(gradient_mean, gradient_prev)
 
             else:
                 # Original IC input mode
@@ -541,8 +573,9 @@ class BiLevelICOptimizer:
 
             if m % 10 == 0:
                 if self.meta_one_task:
+                    mode_str = "Hybrid Input" if self.hybrid_input else "Gradient Input"
                     logger.info(
-                        f"Meta-step {m+1}/{self.num_meta_steps} (Gradient Input): "
+                        f"Meta-step {m+1}/{self.num_meta_steps} ({mode_str}): "
                         f"L_perf={last_l_perf:.6f}, L_reg={last_l_reg:.6e}, "
                         f"cosine_sim={last_cosine_sim:.4f}")
                 else:
@@ -643,17 +676,19 @@ class BiLevelICOptimizer:
         iteration: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Predict IC update using S(θ, x) or S(θ, grad, k).
+        Predict IC update using S(θ, x) or S(θ, grad, k) or S(θ, IC+grad, k).
 
-        Two modes:
+        Three modes:
         - meta_general_training=True: x is IC state
-        - meta_one_task=True: x is gradient, iteration is k
+        - meta_one_task=True, hybrid_input=False: x is gradient, iteration is k
+        - meta_one_task=True, hybrid_input=True: x is IC+gradient concatenated, iteration is k
 
         Args:
-            x: IC state or gradient tensor, shape:
+            x: IC state, gradient tensor, or concatenated [IC+gradient] tensor, shape:
                - [C, H, W] -> output [C, H, W]
                - [B, C, H, W] -> output [B, C, H, W]
                - [B, T, C, H, W] -> output [B, T, C, H, W]
+               - [B, T, 2*C, H, W] for hybrid mode (IC+gradient concatenated)
             gradient_mean: Mean for gradient standardization (meta_general_training mode)
             gradient_std: Std for gradient standardization (meta_general_training mode)
             target_gradient: Target gradient for standardization (meta_general_training mode)

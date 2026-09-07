@@ -1,11 +1,12 @@
 """
-Neural network S(θ, x) or S(θ, grad, k) that learns to predict IC updates.
+Neural network S(θ, x) or S(θ, grad, k) or S(θ, IC+grad, k) that learns to predict IC updates.
 
 Architecture: UNet with skip connections for multi-scale feature extraction.
 
-Two modes:
+Three modes:
 1. meta_general_training=True: Input is raw IC state [B, C, H, W] or [B, T, C, H, W]
-2. meta_one_task=True: Input is gradient [B, C, H, W] or [B, T, C, H, W] + iteration k
+2. meta_one_task=True, hybrid_input=False: Input is gradient [B, C, H, W] or [B, T, C, H, W] + iteration k
+3. meta_one_task=True, hybrid_input=True: Input is IC+gradient concatenated [B, T, 2*C, H, W] + iteration k
 
 Output: Update direction (full step, no learning rate) [B, C, H, W] or [B, T, C, H, W]
 """
@@ -96,16 +97,18 @@ class IterationEmbedding(nn.Module):
 
 class UNetMetaGrad2D(nn.Module):
     """
-    UNet-based update predictor: S(θ, x) → δx or S(θ, grad, k) → δx
+    UNet-based update predictor: S(θ, x) → δx or S(θ, grad, k) → δx or S(θ, IC+grad, k) → δx
     
     Predicts the **full IC update** for one optimization step.
     Multi-scale feature extraction via encoder-decoder with skip connections.
     
-    Two modes:
+    Three modes:
     - meta_general_training=True: Takes IC state as input (original behavior)
-    - meta_one_task=True: Takes gradient + iteration as input
+    - meta_one_task=True, hybrid_input=False: Takes gradient + iteration as input
+    - meta_one_task=True, hybrid_input=True: Takes IC+gradient concatenated + iteration as input
     
     Supports both single-step [B, C, H, W] and temporal [B, T, C, H, W] inputs.
+    For hybrid mode, input is [B, T, 2*C, H, W] (IC + gradient concatenated along channel dimension).
     """
     
     def __init__(self, cfg: NetworkSConfig):
@@ -163,15 +166,17 @@ class UNetMetaGrad2D(nn.Module):
     
     def forward(self, x: torch.Tensor, k: Union[int, torch.Tensor] = None) -> torch.Tensor:
         """
-        Predict IC update from either IC state or gradient + iteration.
+        Predict IC update from IC state, gradient + iteration, or hybrid (IC+gradient) + iteration.
         
-        Two modes:
+        Three modes:
         1. meta_general_training=True: x is IC state [B, C, H, W] or [B, T, C, H, W]
-        2. meta_one_task=True: x is gradient [B, C, H, W] or [B, T, C, H, W], k is iteration
+        2. meta_one_task=True, hybrid_input=False: x is gradient [B, C, H, W] or [B, T, C, H, W], k is iteration
+        3. meta_one_task=True, hybrid_input=True: x is IC+gradient concatenated [B, T, 2*C, H, W], k is iteration
         
         Args:
             x: [B, C, H, W] IC state or gradient tensor (single-step)
                or [B, T, C, H, W] IC state or gradient trajectory (multi-step)
+               or [B, T, 2*C, H, W] for hybrid mode (IC+gradient concatenated)
             k: Iteration number (scalar or tensor). Required when meta_one_task=True.
         
         Returns:

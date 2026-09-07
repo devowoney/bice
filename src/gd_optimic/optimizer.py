@@ -265,13 +265,29 @@ class ICOptimizer:
         if self.use_meta_learner:
             logger.info("\nInitializing BiLevelICOptimizer ...")
             # Create NetworkS config from meta_learner_config
-            # T=2 (temporal steps for IC), C=5 (channels)
+            # T=2 (temporal steps for IC), C=5 (channels) or C=10 for hybrid mode
+            meta_one_task = self.meta_learner_config.get('meta_one_task', False)
+            hybrid_input = self.meta_learner_config.get('hybrid_input', False)
+            
+            # Determine input channels based on mode
+            if meta_one_task and hybrid_input:
+                input_channels = 10  # 5 IC + 5 gradient channels for hybrid mode
+            else:
+                input_channels = 5   # SSH, T, S, U, V
+            
+            # Determine base_channels based on mode (increase for hybrid mode)
+            # Default to 64 for hybrid mode, otherwise use config default (32)
+            if meta_one_task and hybrid_input:
+                base_channels = self.meta_learner_config.get('base_channels', 64)  # Default to 64 for hybrid
+            else:
+                base_channels = self.meta_learner_config.get('base_channels', 32)
+            
             network_s_config = NetworkSConfig(
-                base_channels=self.meta_learner_config.get('base_channels', 32),
+                base_channels=base_channels,
                 num_groups=self.meta_learner_config.get('num_groups', 8),
                 output_scale=self.meta_learner_config.get('output_scale', 0.01),
                 temporal_steps=2,  # IC has T=2 steps
-                input_channels=5,  # SSH, T, S, U, V
+                input_channels=input_channels,
                 output_channels=5,
             )
             
