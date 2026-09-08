@@ -383,9 +383,12 @@ class BiLevelICOptimizer:
                     )
                     
                     # Destandardize using IC statistics (output is an IC update)
+                    # ic_update = (
+                    #     ic_update_standardized * self._channel_scale(ic_update_standardized)
+                    # ) + self._channel_offset(ic_update_standardized)
                     ic_update = (
-                        ic_update_standardized * self._channel_scale(ic_update_standardized)
-                    ) + self._channel_offset(ic_update_standardized)
+                        ic_update_standardized * self._broadcast_channels(gradient_std, gradient_prev) 
+                        ) + self._broadcast_channels(gradient_mean, gradient_prev)
                 else:
                     # EXISTING: Gradient-only mode
                     # Standardize gradient
@@ -445,12 +448,19 @@ class BiLevelICOptimizer:
             # Standardize the target gradient independently for each channel.
             # The statistics are detached: no gradient is propagated through
             # the target normalization.
-            gradient_standardized = (
-                gradient_prev - self._broadcast_channels(gradient_mean, gradient_prev)
-            ) / self._broadcast_channels(gradient_std, gradient_prev)
-            predicted_gradient_standardized = (
-                ic_update - self._broadcast_channels(gradient_mean, ic_update)
-            ) / self._broadcast_channels(gradient_std, ic_update)
+            if self.meta_one_task:
+                gradient_standardized = gradient_standardized
+                predicted_gradient_standardized = ic_update
+            else:
+                gradient_standardized = (
+                    gradient_prev - self._broadcast_channels(gradient_mean, gradient_prev)
+                ) / self._broadcast_channels(gradient_std, gradient_prev)
+                
+                # For gradient-only and original modes: ic_update is already in gradient space
+                predicted_gradient_standardized = (
+                    ic_update - self._broadcast_channels(gradient_mean, ic_update)
+                ) / self._broadcast_channels(gradient_std, ic_update)
+
             l_align = (gradient_standardized - predicted_gradient_standardized).pow(2).mean()
             l_perf = loss_current.mean() if loss_current.dim() > 0 else loss_current
             l_reg_raw = self.lambda_reg * sum((p ** 2).sum() for p in self.network_s.parameters())
@@ -590,7 +600,7 @@ class BiLevelICOptimizer:
             del y_hat_steps_new, ic_update
             del x_new, l_meta
             
-            # Clean up alignment-related variables only for original mode
+            # Clean up alignment-related variables 
             if self.meta_general_training:
                 del l_align, l_align_weighted, l_combined
 
