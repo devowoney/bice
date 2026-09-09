@@ -416,14 +416,34 @@ class BiLevelICOptimizer:
             x_new = x_det - ic_update  # Broadcasting works for [B,T,C,H,W] - [B,T,C,H,W]
 
             # ============================================================================
+            # STEP 2: Forward pass and compute losses
+            # ============================================================================
+            _, y_hat_steps_new = self.forward_model.forward(x_new, self.num_forecast_steps)
+            loss_current, loss_details = self.loss_fn(y_hat_steps_new, self.target_sequence, return_details=True)
+
+            # Extract weights from loss details for weighted comparison
+            loss_weights = loss_details.get('weights', None)  # [B, C] or None
+
+            # ============================================================================
             # STEP 2.5: Compute Cosine Similarity Metric
             # ============================================================================
             # cos(θ) = <meta_output, outer_loop_gradient> / (||meta_output|| ||outer_loop_gradient||)
             # meta_output = ic_update (the learned update from network_s)
             # outer_loop_gradient = gradient_prev (the true gradient)
             # Flatten for cosine similarity calculation
-            meta_flat = ic_update.flatten(start_dim=2)  # [B, T, C*H*W]
-            grad_flat = gradient_prev.flatten(start_dim=2)  # [B, T, C*H*W]
+            # Apply loss weights to ic_update for consistent comparison
+            if loss_weights is not None:
+                # Reshape weights for broadcasting: [B, C] -> [B, 1, C, 1, 1] for 5D tensor
+                weights_reshaped = loss_weights.view(loss_weights.shape[0], 1, loss_weights.shape[1], 1, 1)
+                weighted_ic_update = ic_update * weights_reshaped
+                meta_flat = weighted_ic_update.flatten(start_dim=2)
+                grad_flat = gradient_prev.flatten(start_dim=2)
+                # # Apply same weights to gradient_prev for comparison
+                # weighted_gradient_prev = gradient_prev * weights_reshaped
+                # grad_flat = weighted_gradient_prev.flatten(start_dim=2)
+            else:
+                meta_flat = ic_update.flatten(start_dim=2)
+                grad_flat = gradient_prev.flatten(start_dim=2)
             
             # Cosine similarity per batch and time step
             cosine_sim = torch.nn.functional.cosine_similarity(meta_flat, grad_flat, dim=-1)
@@ -435,12 +455,6 @@ class BiLevelICOptimizer:
             
             # Clean up cosine similarity tensors
             del meta_flat, grad_flat, cosine_sim
-
-            # ============================================================================
-            # STEP 2: Forward pass and compute losses
-            # ============================================================================
-            _, y_hat_steps_new = self.forward_model.forward(x_new, self.num_forecast_steps)
-            loss_current, _ = self.loss_fn(y_hat_steps_new, self.target_sequence, return_details=True)
 
             # ============================================================================
             # STEP 3: Compute channel-standardized alignment loss
@@ -596,9 +610,16 @@ class BiLevelICOptimizer:
                         f"cosine_sim={last_cosine_sim:.4f}")
 
             # Memory cleanup
-            del loss_current, l_reg_scalar, l_perf
+            del loss_current, loss_details, loss_weights, l_reg_scalar, l_perf
             del y_hat_steps_new, ic_update
             del x_new, l_meta
+            # Clean up weighted tensors if they were created
+            if 'weighted_ic_update' in locals():
+                del weighted_ic_update
+            if 'weighted_gradient_prev' in locals():
+                del weighted_gradient_prev
+            if 'weights_reshaped' in locals():
+                del weights_reshaped
             
             # Clean up alignment-related variables 
             if self.meta_general_training:
