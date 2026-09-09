@@ -85,7 +85,13 @@ loss:
   weighting: "manual"  # Options: 'dynamic', 'manual'
                         # 'dynamic': Automatically balance loss magnitudes
                         # 'manual': Use manual_weights below
-  
+
+  dynamic:  # Only used if weighting='dynamic'
+    only_first_iteration: false  # If true, compute the dynamic per-channel weights
+                                  # once on the first optimization iteration, then
+                                  # freeze and reuse them for the rest of the run
+                                  # instead of recomputing every iteration.
+
   manual_weights:  # Weights for [SSH, T, S, U, V] if weighting='manual'
     - 1.0  # SSH
     - 1.0  # T

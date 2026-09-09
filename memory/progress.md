@@ -376,3 +376,19 @@
 
 - **Status:** Feature 3 implementation complete ✅ | Ready for integration testing
 
+## 2026-09-07 — Balanced multi-variate optimization — Research + Feature: `dynamic.only_first_iteration` — IMPLEMENTED ✅
+
+- **Context:** New worktree/branch `balanced-multi-variate-optimization` (`.claude/worktrees/balanced-multi-variate-optimization`) opened to investigate how to jointly optimize the 5-channel IC (SSH, T, S, U, V) through the frozen Glonet surrogate without one channel dominating/stalling the update, while staying physically consistent.
+- **Research:** Full report at `.tmp/research/R_balanced_multivariate_optimization.md`. Headline findings:
+  - LR-sensitivity sweep (`assim3d_*`) shows improvement climbing 9.89% → 28.59% → 80.97% across lr=0.01/0.1/10.0 with no saturation — one scalar step size cannot suit all 5 channels' scales.
+  - Auxiliary-loss domination is the most reproducible failure mode: `sLossLaplacTest` diverged at `structural_loss_weight=10`; meta-learner runs stalled when `L_reg` was ~14x larger than `L_perf` (fixed by `metaNew_noRegL`, nearly doubling improvement).
+  - Plain SGD + existing dynamic per-channel loss weighting (`dynBase`, 66.89% improvement) currently outperforms every meta-learner variant tested.
+  - Caveat: none of the above has been checked against the actual North-Star metric (PSD/spectral consistency) — all figures are loss/RMSE only.
+- **User correction (superseding the report's framing):** even with standardized inputs, the per-channel loss doesn't have balanced influence because there's no penalization term (error covariance matrix) on it — reframes the problem as needing physically-motivated weighting, not just gradient-magnitude balancing.
+- **First test requested:** freeze the dynamic per-channel weights after the first iteration instead of recomputing them every step.
+  - **New config:** `configs/optimize_ic.yaml` → `loss.dynamic.only_first_iteration` (bool, default `false`; only meaningful when `loss.weighting == 'dynamic'`).
+  - **`src/gd_optimic/loss.py`:** `ObservationLoss.__init__` gains `dynamic_only_first_iteration`. `compute_weighted_loss()` and the structural-loss branch in `__call__()` each cache their dynamic weights (`_frozen_dynamic_weights`, `_frozen_struct_dynamic_weights`) on first computation and reuse them thereafter when the flag is set. The two are frozen independently since `J_obs` and `J_struct` weights reflect different loss magnitudes.
+  - **Wired through** `src/run_optimization.py` and `src/run_optimization_slurm.py` (both `ObservationLoss(...)` call sites).
+- **Validation:** `python3 -m py_compile`-equivalent (`ast.parse`) passed on `loss.py`; no end-to-end run executed yet.
+- **Status:** Feature implemented, not yet run. Next: smoke-test with `loss.weighting=dynamic loss.dynamic.only_first_iteration=true` and compare against unfrozen dynamic weighting.
+

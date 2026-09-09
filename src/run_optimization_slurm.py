@@ -330,6 +330,7 @@ def main(cfg: DictConfig):
         obs_mask=obs_mask,
         loss_weighting=cfg.loss.weighting,
         manual_weights=cfg.loss.manual_weights if cfg.loss.weighting == "manual" else None,
+        dynamic_only_first_iteration=cfg.loss.dynamic.only_first_iteration if cfg.loss.weighting == "dynamic" else False,
         use_structural_loss=cfg.loss.use_structural_loss,
         structural_operator=cfg.loss.structural_operator,
         structural_loss_weight=cfg.loss.structural_loss_weight,

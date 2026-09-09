@@ -35,6 +35,7 @@ class ObservationLoss:
         obs_mask: torch.Tensor,
         loss_weighting: str = "dynamic",
         manual_weights: list = None,
+        dynamic_only_first_iteration: bool = False,
         use_structural_loss: bool = False,
         structural_operator: str = "gradient",
         structural_loss_weight: float = 0.01,
@@ -42,13 +43,17 @@ class ObservationLoss:
     ):
         """
         Initialize observation loss function with optional structural consistency term.
-        
+
         Args:
             obs_mask: Observation mask [T, C, H, W] - 1 where obs exist, 0 elsewhere
             loss_weighting: Loss weighting strategy ('dynamic' or 'manual')
                 - 'dynamic': Automatically balance loss magnitudes across variables
                 - 'manual': Use user-specified weights
             manual_weights: Manual weights for each channel [SSH, T, S, U, V] if loss_weighting='manual'
+            dynamic_only_first_iteration: Only used if loss_weighting='dynamic'. If True,
+                compute the dynamic per-channel weights once (on the first call) and
+                freeze them for the rest of the optimization instead of recomputing
+                every iteration.
             use_structural_loss: Enable structural consistency loss term J_struct
             structural_operator: Type of structural operator ('gradient' or 'laplacian')
             structural_loss_weight: Weight for structural loss term (typical range: 0.01-0.1)
@@ -57,6 +62,9 @@ class ObservationLoss:
         self.obs_mask = obs_mask
         self.loss_weighting = loss_weighting
         self.manual_weights = manual_weights
+        self.dynamic_only_first_iteration = dynamic_only_first_iteration
+        self._frozen_dynamic_weights = None
+        self._frozen_struct_dynamic_weights = None
         self.device = device
         
         # MSE loss function
@@ -189,8 +197,13 @@ class ObservationLoss:
         _, nloss_sum_intime, _, _ = self.compute_normalized_mse(predictions, targets)
         
         if self.loss_weighting == 'dynamic':
-            weights = self._compute_dynamic_weights(nloss_sum_intime)
-            
+            if self.dynamic_only_first_iteration and self._frozen_dynamic_weights is not None:
+                weights = self._frozen_dynamic_weights.to(nloss_sum_intime.device)
+            else:
+                weights = self._compute_dynamic_weights(nloss_sum_intime)
+                if self.dynamic_only_first_iteration:
+                    self._frozen_dynamic_weights = weights.detach().clone()
+
         elif self.loss_weighting == 'manual':
             # Manual weights from configuration
             if self.manual_weights is None:
@@ -304,7 +317,12 @@ class ObservationLoss:
                 if self.loss_weighting == 'dynamic':
                     # Structural dynamic weights must reflect structural loss
                     # magnitudes, not observation loss magnitudes.
-                    struct_weights = self._compute_dynamic_weights(struct_mse_per_var)
+                    if self.dynamic_only_first_iteration and self._frozen_struct_dynamic_weights is not None:
+                        struct_weights = self._frozen_struct_dynamic_weights.to(struct_mse_per_var.device)
+                    else:
+                        struct_weights = self._compute_dynamic_weights(struct_mse_per_var)
+                        if self.dynamic_only_first_iteration:
+                            self._frozen_struct_dynamic_weights = struct_weights.detach().clone()
                 else:
                     # Manual weights are configured once and apply directly to
                     # both observation and structural terms.
