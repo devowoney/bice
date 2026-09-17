@@ -313,6 +313,8 @@ class BiLevelICOptimizer:
         last_l_perf = 0.0
         last_l_reg = 0.0
         last_cosine_sim = 0.0
+        final_loss = None
+        final_y_hat_steps = None
 
         x_det = x_current.detach()
         for m in range(self.num_meta_steps):
@@ -418,11 +420,24 @@ class BiLevelICOptimizer:
             # ============================================================================
             # STEP 2: Forward pass and compute losses
             # ============================================================================
-            _, y_hat_steps_new = self.forward_model.forward(x_new, self.num_forecast_steps)
-            loss_current, loss_details = self.loss_fn(y_hat_steps_new, self.target_sequence, return_details=True)
+            # L_perf is only used outside the ALIGN phase (see STEP 4 below), so the
+            # forecast rollout + loss evaluation is skipped during pure ALIGN steps to
+            # avoid paying for a forward pass whose result is never used in l_meta.
+            # The final meta-step always runs it so a valid loss/prediction is
+            # returned to the outer loop regardless of which phase it lands in.
+            needs_forward = (phase_name != "ALIGN") or (m == self.num_meta_steps - 1)
 
-            # Extract weights from loss details for weighted comparison
-            loss_weights = loss_details.get('weights', None)  # [B, C] or None
+            if needs_forward:
+                _, y_hat_steps_new = self.forward_model.forward(x_new, self.num_forecast_steps)
+                loss_current, loss_details = self.loss_fn(y_hat_steps_new, self.target_sequence, return_details=True)
+
+                # Extract weights from loss details for weighted comparison
+                loss_weights = loss_details.get('weights', None)  # [B, C] or None
+            else:
+                y_hat_steps_new = None
+                loss_current = None
+                loss_details = None
+                loss_weights = None
 
             # ============================================================================
             # STEP 2.5: Compute Cosine Similarity Metric
@@ -476,12 +491,14 @@ class BiLevelICOptimizer:
                 ) / self._broadcast_channels(gradient_std, ic_update)
 
             l_align = (gradient_standardized - predicted_gradient_standardized).pow(2).mean()
-            l_perf = loss_current.mean() if loss_current.dim() > 0 else loss_current
+            l_perf = (
+                loss_current.mean() if loss_current is not None and loss_current.dim() > 0 else loss_current
+            )
             l_reg_raw = self.lambda_reg * sum((p ** 2).sum() for p in self.network_s.parameters())
             l_reg_scalar = l_reg_raw / sum(p.numel() for p in self.network_s.parameters())
 
             # Diagnostic: Check gradient flow on first meta-step
-            if m == 0 and self.meta_general_training:
+            if m == 0 and self.meta_general_training and loss_current is not None:
                 logger.debug(f"[iter: 0]: ic_update requires_grad={ic_update.requires_grad}, "
                             f"grad_fn={ic_update.grad_fn}, "
                             f"l_align requires_grad={l_align.requires_grad}, "
@@ -497,17 +514,19 @@ class BiLevelICOptimizer:
             # Safe gradient clearing (not in-place on graph)
             self.meta_optimizer.zero_grad()
 
-            l_perf_weighted = self.w_perf * l_perf
+            l_perf_weighted = self.w_perf * l_perf if l_perf is not None else None
             l_reg_weighted = self.lambda_reg * l_reg_scalar
 
             # Choose meta-loss based on mode
             if self.meta_one_task:
                 # Gradient input mode: use phase-based loss with alignment
                 l_align_weighted = self.w_align * l_align
-                l_combined = l_align_weighted + l_perf_weighted + l_reg_weighted
+                l_combined = l_align_weighted + l_reg_weighted + (
+                    l_perf_weighted if l_perf_weighted is not None else 0.0
+                )
 
                 if phase_name == "ALIGN":
-                    # ALIGN phase: Focus on gradient alignment
+                    # ALIGN phase: Focus on gradient alignment (forward pass skipped)
                     l_meta = l_align_weighted + l_reg_weighted
                     logger.debug(f"ALIGN: l_meta={l_meta.item():.6f}")
                 elif phase_name == "TRANS":
@@ -521,10 +540,12 @@ class BiLevelICOptimizer:
             else:
                 # Original IC input mode: use phase-based loss with alignment
                 l_align_weighted = self.w_align * l_align
-                l_combined = l_align_weighted + l_perf_weighted + l_reg_weighted
+                l_combined = l_align_weighted + l_reg_weighted + (
+                    l_perf_weighted if l_perf_weighted is not None else 0.0
+                )
 
                 if phase_name == "ALIGN":
-                    # ALIGN phase: Focus on gradient alignment
+                    # ALIGN phase: Focus on gradient alignment (forward pass skipped)
                     l_meta = l_align_weighted + l_reg_weighted
                     logger.debug(f"ALIGN: l_meta={l_meta.item():.6f}")
 
@@ -565,11 +586,15 @@ class BiLevelICOptimizer:
             # Update state for next iteration
             x_det = x_new.detach()
             final_x = x_det
-            final_loss = float(loss_current.detach().cpu().item())
-            final_y_hat_steps = y_hat_steps_new.detach()
+            if loss_current is not None:
+                final_loss = float(loss_current.detach().cpu().item())
+                final_y_hat_steps = y_hat_steps_new.detach()
 
-            # Cache loss values for logging
-            last_l_perf = float(l_perf_weighted.detach().cpu().item())
+            # Cache loss values for logging. When the forward pass was skipped
+            # (ALIGN-phase step), l_perf_weighted is None, so keep the previously
+            # cached value rather than overwriting it.
+            if l_perf_weighted is not None:
+                last_l_perf = float(l_perf_weighted.detach().cpu().item())
             last_l_reg = float(l_reg_weighted.detach().cpu().item())
             
             # For original mode, cache alignment-related values
