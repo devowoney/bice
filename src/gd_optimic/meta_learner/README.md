@@ -122,8 +122,6 @@ from gd_optimic.meta_learner import NetworkS, NetworkSConfig, BiLevelICOptimizer
 cfg_s = NetworkSConfig(
     input_channels=5,
     output_channels=5,
-    spatial_height=330,
-    spatial_width=360,
     base_channels=32,      # UNet encoder/decoder depth
     num_groups=8,          # GroupNorm groups
     temporal_steps=1,      # Single IC (not trajectory)

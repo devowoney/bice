@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from typing import Union
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -24,9 +23,7 @@ class NetworkSConfig:
     
     input_channels: int = 5  # IC channels (SSH, T, S, U, V) or gradient channels
     output_channels: int = 5  # Same as input (spatial update)
-    spatial_height: int = 330
-    spatial_width: int = 360
-    
+
     # UNet architecture
     base_channels: int = 32  # Base channels for encoder/decoder
     num_groups: int = 8  # Groups for GroupNorm
@@ -219,38 +216,37 @@ class UNetMetaGrad2D(nn.Module):
         # Encoder with skip connections
         e1 = self.enc1(x_with_k)              # (B, b, H, W)
         p1 = self.pool1(e1)            # (B, b, H/2, W/2)
-        
-        # Apply checkpointing to large encoder blocks to save memory during higher-order grads
-        e2 = checkpoint(self.enc2, p1, use_reentrant=False)             # (B, 2b, H/2, W/2)
+
+        e2 = self.enc2(p1)             # (B, 2b, H/2, W/2)
         p2 = self.pool2(e2)            # (B, 2b, H/4, W/4)
-        
-        e3 = checkpoint(self.enc3, p2, use_reentrant=False)             # (B, 4b, H/4, W/4)
+
+        e3 = self.enc3(p2)             # (B, 4b, H/4, W/4)
         p3 = self.pool3(e3)            # (B, 4b, H/8, W/8)
-        
-        e4 = checkpoint(self.enc4, p3, use_reentrant=False)             # (B, 8b, H/8, W/8)
+
+        e4 = self.enc4(p3)             # (B, 8b, H/8, W/8)
         p4 = self.pool4(e4)            # (B, 8b, H/16, W/16)
-        
-        # Bottleneck (checkpoint)
-        b_out = checkpoint(self.bottleneck, p4, use_reentrant=False)    # (B, 16b, H/8, W/8)
-        
+
+        # Bottleneck
+        b_out = self.bottleneck(p4)    # (B, 16b, H/8, W/8)
+
         b = self.cfg.base_channels
-        
+
         # Decoder with skip connections (channels must match concat dims)
         d4 = self.up4(b_out)           # (B, 8b, H/4, W/4)
         d4 = torch.cat([d4, e4], dim=1)  # (B, 16b, H/4, W/4)
-        d4 = checkpoint(self.dec4, d4, use_reentrant=False)             # (B, 8b, H/4, W/4)
-        
+        d4 = self.dec4(d4)             # (B, 8b, H/4, W/4)
+
         d3 = self.up3(d4)              # (B, 4b, H/2, W/2)
         d3 = torch.cat([d3, e3], dim=1)  # (B, 8b, H/2, W/2)
-        d3 = checkpoint(self.dec3, d3, use_reentrant=False)             # (B, 4b, H/2, W/2)
-        
+        d3 = self.dec3(d3)             # (B, 4b, H/2, W/2)
+
         d2 = self.up2(d3)              # (B, 2b, H, W)
         d2 = torch.cat([d2, e2], dim=1)  # (B, 4b, H, W)
-        d2 = checkpoint(self.dec2, d2, use_reentrant=False)             # (B, 2b, H, W)
-        
+        d2 = self.dec2(d2)             # (B, 2b, H, W)
+
         d1 = self.up1(d2)              # (B, b, H, W)
         d1 = torch.cat([d1, e1], dim=1)  # (B, 2b, H, W)
-        d1 = checkpoint(self.dec1, d1, use_reentrant=False)             # (B, b, H, W)
+        d1 = self.dec1(d1)             # (B, b, H, W)
         
         # Output head
         out = self.out_conv(d1)        # (B, out_ch, H, W)
