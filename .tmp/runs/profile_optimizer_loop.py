@@ -146,6 +146,11 @@ def parse_args():
     p.add_argument("--iterations", type=int, default=20, help="num_iterations override (kept small)")
     p.add_argument("--save-frequency", type=int, default=10, help="checkpoint save frequency override")
     p.add_argument("--config-name", type=str, default="optimize_ic")
+    p.add_argument(
+        "--latent-off", action="store_true",
+        help="Test-only: set model.inner_checkpoint_blocks.latent=false (verifies the new "
+             "ForwardModel/GlonetGradientCheckpointing inner_checkpoint_blocks passthrough).",
+    )
     return p.parse_args()
 
 
@@ -155,6 +160,11 @@ def main():
     cfg = OmegaConf.load(REPO_ROOT / "configs" / f"{args.config_name}.yaml")
     cfg.optimization.num_iterations = args.iterations
     cfg.logging.save_frequency = args.save_frequency
+    if args.latent_off:
+        cfg.model.inner_checkpoint_blocks = {
+            "spatial": True, "latent": False, "temporal": True, "predictions": True,
+        }
+        print("Test override: model.inner_checkpoint_blocks.latent = False")
     # Keep production defaults for log_frequency / histogram_frequency (this is exactly
     # what we're trying to measure the cost of).
 
@@ -225,12 +235,16 @@ def main():
     target_tensor = torch.from_numpy(target_data[:, 0:5, :, :].copy()).float().unsqueeze(0).to(device)
 
     print("[5/9] Initializing forward model...")
+    inner_checkpoint_blocks = cfg.model.get("inner_checkpoint_blocks", None)
+    if inner_checkpoint_blocks is not None:
+        inner_checkpoint_blocks = dict(inner_checkpoint_blocks)
     forward_model = ForwardModel(
         model_path=str(Path(cfg.model.location) / cfg.model.checkpoint_files.part1),
         normalizer_path=cfg.model.location,
         device=device,
         use_gradient_checkpointing=cfg.model.use_gradient_checkpointing,
         ocean_mask=ocean_mask.to(device) if ocean_mask is not None else None,
+        inner_checkpoint_blocks=inner_checkpoint_blocks,
     )
 
     print("[6/9] Initializing loss function...")

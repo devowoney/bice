@@ -258,6 +258,7 @@ class ForwardModel:
         device: str = "cuda",
         use_gradient_checkpointing: bool = True,
         ocean_mask: torch.Tensor = None,
+        inner_checkpoint_blocks: Dict[str, bool] = None,
     ):
         """
         Initialize forward model.
@@ -268,10 +269,18 @@ class ForwardModel:
             device: PyTorch device ('cuda' or 'cpu')
             use_gradient_checkpointing: Whether to use gradient checkpointing for memory efficiency
             ocean_mask: Ocean mask [C, H, W] to apply after normalization (optional, for notebook compatibility)
+            inner_checkpoint_blocks: Optional per-block override for GlonetGradientCheckpointing's
+                4 internal checkpoints ({"spatial", "latent", "temporal", "predictions"} -> bool).
+                None keeps the default of checkpointing all 4 blocks (safe on any GPU size).
+                On high-memory GPUs (e.g. H200), "latent": False trades ~19GB extra peak memory
+                for ~4% less forward+backward time. "spatial" and "temporal" must stay True --
+                confirmed OOM otherwise on a 140GB GPU. Only used when use_gradient_checkpointing
+                is True (it configures GlonetGradientCheckpointing, not the raw Glonet fallback).
         """
         self.device = device
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.ocean_mask = ocean_mask
+        self.inner_checkpoint_blocks = inner_checkpoint_blocks
 
         # Load normalizers
         self.normalizer = get_normalizer1(normalizer_path)
@@ -304,7 +313,9 @@ class ForwardModel:
 
         # Create model with gradient checkpointing if enabled
         if self.use_gradient_checkpointing:
-            model = GlonetGradientCheckpointing(shape_in=(2, 5, 672, 1440))
+            model = GlonetGradientCheckpointing(
+                shape_in=(2, 5, 672, 1440), checkpoint_blocks=self.inner_checkpoint_blocks
+            )
         else:
             # Fallback: try importing Glonet directly
             try:

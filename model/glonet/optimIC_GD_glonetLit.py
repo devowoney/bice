@@ -2,7 +2,7 @@ import hydra
 import torch
 from torch import nn
 import pytorch_lightning as pl
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Optional, Tuple
 from hydra.utils import instantiate
 import xarray as xr
 import numpy as np
@@ -23,56 +23,76 @@ import torch.utils.checkpoint as checkpoint_util
 
 
 
+# Default: checkpoint all 4 inner blocks (today's behavior, safe on any GPU size).
+DEFAULT_INNER_CHECKPOINT_BLOCKS = {
+    "spatial": True,      # self.jump + self.space, full resolution -- confirmed OOM if False (H200, 140GB)
+    "latent": True,       # self.maps -- safe to set False on high-memory GPUs (+~19GB, ~4% faster)
+    "temporal": True,     # self.dynamics -- confirmed OOM if False (H200, 140GB)
+    "predictions": True,  # self.mapsback -- only set False with extra memory margin (+~59GB, ~2.5% faster)
+}
+
+
 class GlonetGradientCheckpointing(Glonet) :
-    def __init__(self, shape_in, hid_S=256, hid_T=128, N_S=2, N_T=8, incep_ker=[3,5,7,11], groups=8):
+    def __init__(self, shape_in, hid_S=256, hid_T=128, N_S=2, N_T=8, incep_ker=[3,5,7,11], groups=8,
+                 checkpoint_blocks: Optional[Dict[str, bool]] = None):
         super().__init__(shape_in, hid_S, hid_T, N_S, N_T, incep_ker, groups)
-    
+        # Per-block inner-checkpoint toggle (memory/speed tradeoff). None -> today's
+        # default of checkpointing all 4 blocks, unchanged from prior behavior.
+        self.checkpoint_blocks = checkpoint_blocks or dict(DEFAULT_INNER_CHECKPOINT_BLOCKS)
+
     def forward(self, input_st_tensors):
         B, T, C, H, W = input_st_tensors.shape
-        
+
         # Use gradient checkpointing for memory-intensive operations
         def compute_spatial_features(x):
             skip_feature = self.jump(x)
             spatial_feature = self.space(x)
             return skip_feature, spatial_feature
-        
+
         def compute_latent_features(spatial_feature):
             spatial_feature = spatial_feature.reshape(-1, C, H, W)
             return self.maps(spatial_feature)
-        
+
         def compute_temporal_features(spatial_embed):
             return self.dynamics(spatial_embed)
-        
+
         def compute_predictions(spatialtemporal_embed, spatial_skip_feature):
             return self.mapsback(spatialtemporal_embed, spatial_skip_feature)
-        
-        # Apply gradient checkpointing to reduce memory usage
-        skip_feature, spatial_feature = checkpoint_util.checkpoint(
-            compute_spatial_features, input_st_tensors, use_reentrant=False
+
+        def run_block(name, fn, *args):
+            # Checkpoint the block (trade compute for memory) only if enabled for it;
+            # otherwise call directly and keep its activations in memory.
+            if self.checkpoint_blocks[name]:
+                return checkpoint_util.checkpoint(fn, *args, use_reentrant=False)
+            return fn(*args)
+
+        # Apply gradient checkpointing to reduce memory usage (per-block, configurable)
+        skip_feature, spatial_feature = run_block(
+            "spatial", compute_spatial_features, input_st_tensors
         )
-        
-        spatial_embed, spatial_skip_feature = checkpoint_util.checkpoint(
-            compute_latent_features, spatial_feature, use_reentrant=False
+
+        spatial_embed, spatial_skip_feature = run_block(
+            "latent", compute_latent_features, spatial_feature
         )
-        
+
         # Reshape for temporal processing
         _, C_, H_, W_ = spatial_embed.shape
         spatial_embed = spatial_embed.view(B, T, C_, H_, W_)
-        
-        spatialtemporal_embed = checkpoint_util.checkpoint(
-            compute_temporal_features, spatial_embed, use_reentrant=False
+
+        spatialtemporal_embed = run_block(
+            "temporal", compute_temporal_features, spatial_embed
         )
-        
+
         # Reshape back
         spatialtemporal_embed = spatialtemporal_embed.reshape(B*T, C_, H_, W_)
-        
-        predictions = checkpoint_util.checkpoint(
-            compute_predictions, spatialtemporal_embed, spatial_skip_feature, use_reentrant=False
+
+        predictions = run_block(
+            "predictions", compute_predictions, spatialtemporal_embed, spatial_skip_feature
         )
-        
+
         # Final computation
         predictions = 0.05 * predictions.reshape(B, T, C, H, W) + skip_feature
-        
+
         return predictions
 
 
