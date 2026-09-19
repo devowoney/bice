@@ -559,12 +559,17 @@ class ICOptimizer:
             if self.use_meta_learner and history_meta_loss is not None:
                 history_entry["meta_loss"] = history_meta_loss
 
+            # Computed once here (used by history_entry unconditionally, and passed
+            # to _log_to_tensorboard below when logging -- avoids recomputing the
+            # identical (self._last_ic_update, self._ocean_mask) finite-difference
+            # a second time on the same inputs).
+            step_finite_diff = None
             if self._last_ic_update is not None and self._ocean_mask is not None:
-                finite_diff_total, _ = self._compute_finite_difference_ic_update(
+                step_finite_diff = self._compute_finite_difference_ic_update(
                     self._last_ic_update[0, -1],
                     self._ocean_mask.detach().cpu(),
                 )
-                history_entry["gradient_finite_difference_ic_update"] = finite_diff_total
+                history_entry["gradient_finite_difference_ic_update"] = step_finite_diff[0]
 
             if regional_masks is not None:
                 history_entry["rmse_basin"] = metrics["rmse_basin"]
@@ -581,6 +586,7 @@ class ICOptimizer:
                     current_kernel,
                     x0_current=x0_current,
                     x0_reference=x0_reference,
+                    step_finite_diff=step_finite_diff,
                 )
 
             # Log histograms/embeddings less frequently
@@ -653,8 +659,8 @@ class ICOptimizer:
         kernel_size: int,
         x0_current: Optional[torch.Tensor] = None,
         x0_reference: Optional[torch.Tensor] = None,
+        step_finite_diff: Optional[Tuple[float, Dict]] = None,
     ):
-
         """
         Log metrics to TensorBoard.
 
@@ -662,14 +668,10 @@ class ICOptimizer:
         loss/J_obs/{total,ssh,sst,uo,vo}
         metrics/rmse/{global,basin}/{var}
         state/ic/{norm,update_magnitude}
-        """
-        """
-        Log metrics to TensorBoard.
 
-        Follows R8 decision on TensorBoard hierarchy:
-        loss/J_obs/{total,ssh,sst,uo,vo}
-        metrics/rmse/{global,basin}/{var}
-        state/ic/{norm,update_magnitude}
+        step_finite_diff: optional (total, per_channel) tuple already computed by the
+        caller for (self._last_ic_update, self._ocean_mask) -- passed in to avoid
+        recomputing the identical finite-difference a second time here.
         """
         # Loss metrics (per-variable)
         per_var = loss_details["weighted_per_variable"]
@@ -705,11 +707,8 @@ class ICOptimizer:
             self.writer.add_scalar(f"metrics/ic_rmse/{var}", rmse, iteration)
 
         # Finite-difference IC update norm on the step correction field
-        if self._last_ic_update is not None and self._ocean_mask is not None:
-            finite_diff_total, finite_diff_per_channel = self._compute_finite_difference_ic_update(
-                self._last_ic_update[0, -1],
-                self._ocean_mask.detach().cpu(),
-            )
+        if step_finite_diff is not None:
+            finite_diff_total, finite_diff_per_channel = step_finite_diff
             self.writer.add_scalar(
                 "diag/finite_difference_ic_update/total",
                 finite_diff_total,

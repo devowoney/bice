@@ -26,8 +26,6 @@ base = Path(__file__).resolve().parent
 lib_dir = (base / ".." / ".." / "model" / "glonet").resolve()
 sys.path.insert(0, str(lib_dir))
 from utility import get_normalizer1, get_denormalizer1
-from modelp2 import Glonet
-from .data import GlonetDataset
 
 
 class MaskBuilder:
@@ -280,7 +278,11 @@ class ForwardModel:
         self.device = device
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.ocean_mask = ocean_mask
-        self.inner_checkpoint_blocks = inner_checkpoint_blocks
+        # Normalize here (once) so callers can pass a plain dict OR an OmegaConf
+        # DictConfig straight from Hydra config without each call site converting it.
+        self.inner_checkpoint_blocks = (
+            dict(inner_checkpoint_blocks) if inner_checkpoint_blocks is not None else None
+        )
 
         # Load normalizers
         self.normalizer = get_normalizer1(normalizer_path)
@@ -311,20 +313,16 @@ class ForwardModel:
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
-        # Create model with gradient checkpointing if enabled
-        if self.use_gradient_checkpointing:
-            model = GlonetGradientCheckpointing(
-                shape_in=(2, 5, 672, 1440), checkpoint_blocks=self.inner_checkpoint_blocks
-            )
-        else:
-            # Fallback: try importing Glonet directly
-            try:
-                from modelp2 import Glonet
-
-                model = Glonet(shape_in=(2, 5, 672, 1440))
-            except ImportError:
-                logger.warning("Falling back to GlonetGradientCheckpointing (Glonet import failed)")
-                model = GlonetGradientCheckpointing(shape_in=(2, 5, 672, 1440))
+        # Always load GlonetGradientCheckpointing, regardless of use_gradient_checkpointing.
+        # That flag controls ONLY the outer rollout-level checkpoint wrap in
+        # ForwardModel.forward() -- it must not also select the model class. The raw
+        # `Glonet` class (modelp2.py) has hardcoded .detach() calls that permanently
+        # break autograd back to the IC (see findings.md R1); it was never meant to be
+        # used for gradient-based optimization. GlonetGradientCheckpointing is also the
+        # only class that respects inner_checkpoint_blocks.
+        model = GlonetGradientCheckpointing(
+            shape_in=(2, 5, 672, 1440), checkpoint_blocks=self.inner_checkpoint_blocks
+        )
 
         # Load weights
         model.load_state_dict(checkpoint["model_state_dict"])

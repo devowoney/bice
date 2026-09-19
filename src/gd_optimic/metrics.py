@@ -49,6 +49,11 @@ class MetricsComputer:
         """
         self.ocean_mask = ocean_mask
         self.device = device
+        # Cache for regional_masks (numpy -> GPU tensor) conversions, keyed by
+        # id(regional_masks): the caller builds this dict once per run and passes the
+        # same object every iteration, so converting it fresh every call is wasted
+        # host->device transfer work.
+        self._regional_masks_gpu_cache: Dict[int, Dict[str, torch.Tensor]] = {}
         # Mean field used to compute anomalies for diagnostics. If None, will be computed from input data when available.
         # Stored as torch.Tensor on same device with shape [C, H, W]
         self.mean_field = None
@@ -212,17 +217,19 @@ class MetricsComputer:
             rmse_dict: Nested dictionary {region: {variable: rmse}}
         """
         rmse_dict = {}
-        
-        # Move predictions and targets to CPU for regional computation
-        pred_cpu = predictions.detach().cpu().numpy()
-        targ_cpu = targets.detach().cpu().numpy()
-        
-        for region_name, region_mask in regional_masks.items():
-            region_rmse = {}
-            
-            # Convert mask to torch tensor
-            region_mask_torch = torch.from_numpy(region_mask).float().to(self.device)
-            
+
+        # Convert each region's mask to a GPU tensor once per regional_masks object
+        # (see _regional_masks_gpu_cache), not on every call.
+        cache_key = id(regional_masks)
+        masks_gpu = self._regional_masks_gpu_cache.get(cache_key)
+        if masks_gpu is None:
+            masks_gpu = {
+                name: torch.from_numpy(mask).float().to(self.device)
+                for name, mask in regional_masks.items()
+            }
+            self._regional_masks_gpu_cache = {cache_key: masks_gpu}
+
+        for region_name, region_mask_torch in masks_gpu.items():
             # Apply regional mask to predictions and targets
             # region_mask: [C, H, W], broadcast to [B, C, H, W]
             pred_regional = predictions * region_mask_torch.unsqueeze(0)

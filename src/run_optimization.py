@@ -203,18 +203,16 @@ def main(cfg: DictConfig):
     # 5. Initialize Forward Model
     # -------------------------------------------------------------------------
     logger.info("Initializing forward model...")
-    # Optional per-block inner-checkpoint override (memory/speed tradeoff). Omit from
-    # config to keep the default of checkpointing all 4 blocks.
-    inner_checkpoint_blocks = cfg.model.get("inner_checkpoint_blocks", None)
-    if inner_checkpoint_blocks is not None:
-        inner_checkpoint_blocks = dict(inner_checkpoint_blocks)
     forward_model = ForwardModel(
         model_path=str(Path(cfg.model.location) / cfg.model.checkpoint_files.part1),
         normalizer_path=cfg.model.location,
         device=device,
         use_gradient_checkpointing=cfg.model.use_gradient_checkpointing,
         ocean_mask=ocean_mask.to(device) if ocean_mask is not None else None,
-        inner_checkpoint_blocks=inner_checkpoint_blocks,
+        # Optional per-block inner-checkpoint override (memory/speed tradeoff); omit
+        # from config to keep the default of checkpointing all 4 blocks. ForwardModel
+        # normalizes an OmegaConf DictConfig to a plain dict itself.
+        inner_checkpoint_blocks=cfg.model.get("inner_checkpoint_blocks", None),
     )
 
     logger.info(f"Initialized forward model (gradient checkpointing: {cfg.model.use_gradient_checkpointing})")

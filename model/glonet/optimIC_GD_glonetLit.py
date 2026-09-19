@@ -36,9 +36,10 @@ class GlonetGradientCheckpointing(Glonet) :
     def __init__(self, shape_in, hid_S=256, hid_T=128, N_S=2, N_T=8, incep_ker=[3,5,7,11], groups=8,
                  checkpoint_blocks: Optional[Dict[str, bool]] = None):
         super().__init__(shape_in, hid_S, hid_T, N_S, N_T, incep_ker, groups)
-        # Per-block inner-checkpoint toggle (memory/speed tradeoff). None -> today's
-        # default of checkpointing all 4 blocks, unchanged from prior behavior.
-        self.checkpoint_blocks = checkpoint_blocks or dict(DEFAULT_INNER_CHECKPOINT_BLOCKS)
+        # Per-block inner-checkpoint toggle (memory/speed tradeoff). Merge onto the
+        # default so a caller/config only needs to specify the block(s) it's
+        # overriding (e.g. {"latent": False}) rather than all 4 keys every time.
+        self.checkpoint_blocks = {**DEFAULT_INNER_CHECKPOINT_BLOCKS, **(checkpoint_blocks or {})}
 
     def forward(self, input_st_tensors):
         B, T, C, H, W = input_st_tensors.shape
