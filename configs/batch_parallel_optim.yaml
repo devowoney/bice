@@ -11,7 +11,7 @@ experiment:
   #  Align output directory with main script
 hydra:
   run:
-    dir: .tmp/runs/${experiment.name}_${experiment.timestamp}
+    dir: .tmp/runs/parallel_${experiment.name}/${experiment.timestamp}
   sweep:
     dir: .tmp/multiruns/${experiment.name}_${experiment.timestamp}
   job:
@@ -46,6 +46,7 @@ data:
   sequence_length: 2  # IC sequence length (glonet requires T=2)
   observation_length: 7  # Number of observation time steps
   forecast_horizon: 28  # Total forecast horizon (7-day assimilation + 3-week forecast)
+  batch_size: 50 # Number of optimization problem from sample_idx on input data
 
 # Model configuration
 model:

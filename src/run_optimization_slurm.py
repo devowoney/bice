@@ -385,6 +385,7 @@ def main(cfg: DictConfig):
     # -------------------------------------------------------------------------
     logger.info("Initializing optimizer...")
 
+    logging_output_dir = ""
     # Create output directories following project structure
     optimizer = ICOptimizer(
         forward_model=forward_model,
@@ -394,7 +395,7 @@ def main(cfg: DictConfig):
         learning_rate=cfg.optimization.learning_rate,
         num_iterations=cfg.optimization.num_iterations,
         device=device,
-        output_dir=cfg.logging.output_dir,
+        output_dir=logging_output_dir,
         tensorboard_subdir=cfg.logging.tensorboard_subdir,
         checkpoints_subdir=cfg.logging.checkpoints_subdir,
         metrics_subdir=cfg.logging.metrics_subdir,
@@ -413,6 +414,7 @@ def main(cfg: DictConfig):
     # -------------------------------------------------------------------------
     logger.info("Starting optimization...")
 
+    exp_id = ""
     best_x0, results = optimizer.optimize(
         x0_init=x0_init,
         target_sequence=target_tensor,
