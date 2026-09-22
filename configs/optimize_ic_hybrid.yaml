@@ -54,6 +54,20 @@ model:
     part1: "glonet_part1.pth"  # Surface model (5 channels)
   use_gradient_checkpointing: true  # Memory-efficient backprop
 
+  # Optional: per-block inner-checkpoint override inside GlonetGradientCheckpointing
+  # (only applies when use_gradient_checkpointing is true). Omit this whole section to
+  # keep the default of checkpointing all 4 blocks -- safe on any GPU size.
+  # Profiled on H200 (140GB), 7-step rollout, outer checkpoint on:
+  #   spatial:      true   # MUST stay true -- confirmed OOM if false
+  #   latent:       false  # safe to disable on high-memory GPUs: +~19GB peak, ~4% faster
+  #   temporal:     true   # MUST stay true -- confirmed OOM if false
+  #   predictions:  true   # only disable with extra memory margin: +~59GB peak, ~2.5% faster
+  inner_checkpoint_blocks:
+    spatial: true
+    latent: false
+    temporal: true
+    predictions: true
+
 # Observation configuration (A2-compliant)
 observations:
   mode: "full"  # Options: 'full', 'simulated', 'real'
