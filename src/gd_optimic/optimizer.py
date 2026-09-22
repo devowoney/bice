@@ -142,7 +142,8 @@ class ICOptimizer:
         self.best_iteration = 0
         self.best_x0 = None
         self.best_predictions = None
-          
+        self.best_network_s_state = None  # network_s weights at best_iteration (meta-learner)
+
         # Store xarray datasets for NetCDF output (set during optimize())
         self.input_sequence_xr = None
         self.target_sequence_xr = None
@@ -557,6 +558,14 @@ class ICOptimizer:
                 self.best_iteration = iteration + 1
                 self.best_x0 = x0_current.detach().clone()
                 self.best_predictions = y_hat_steps.detach().clone()
+                # Cache network_s weights in memory (cheap CPU copy, no disk I/O)
+                # so the true best-loss meta-learner state can be persisted at the
+                # end of the run even if it doesn't land on a save_frequency boundary.
+                if self.use_meta_learner and self.meta_learner is not None:
+                    self.best_network_s_state = {
+                        k: v.detach().cpu().clone()
+                        for k, v in self.meta_learner.network_s.state_dict().items()
+                    }
 
             # Store history
             history_entry = {
@@ -615,10 +624,13 @@ class ICOptimizer:
             if (iteration + 1) % self.save_frequency == 0 or iteration == 0:
                 self._print_progress(iteration + 1, loss.item(), metrics, current_kernel)
 
-            # Save checkpoint
-            if (iteration + 1) % self.save_frequency == 0:
+            # Save checkpoint. Always save on the final iteration too, even if it
+            # doesn't land on a save_frequency boundary, so the last trained state
+            # is never silently dropped.
+            is_last_iteration = (iteration + 1) == self.num_iterations
+            if (iteration + 1) % self.save_frequency == 0 or is_last_iteration:
                 self._save_checkpoint(iteration + 1, x0_current, y_hat_steps)
-                
+
                 # Save meta-learner checkpoint if enabled
                 if self.use_meta_learner and self.meta_learner is not None:
                     self.checkpoint_manager.save_meta_learner(
@@ -1044,7 +1056,19 @@ class ICOptimizer:
         )
 
         logger.info(f"Saved best solution: {best_path}")
-         
+
+        # Save the meta-learner state at the best-loss iteration, since periodic
+        # save_frequency snapshots don't necessarily land on best_iteration.
+        if self.use_meta_learner and self.best_network_s_state is not None:
+            self.checkpoint_manager.save_meta_learner_state(
+                network_s_state=self.best_network_s_state,
+                meta_optimizer_state=None,
+                iteration=self.best_iteration,
+                meta_loss=self.best_loss,
+                meta_loss_history=self.meta_learner.loss_history if self.meta_learner is not None else None,
+                filename="meta_learner_best.pt",
+            )
+
         # Save state NetCDF + visualization diagnostics (if xarray datasets are provided)
         if self.input_sequence_xr is not None and self.target_sequence_xr is not None:
             try:

@@ -48,33 +48,70 @@ class MetaLearnerCheckpointManager:
         iteration: int,
         meta_loss: float,
         meta_loss_history: list = None,
+        filename: Optional[str] = None,
     ) -> Path:
         """
         Save meta-learner checkpoint.
-        
+
         Args:
             network_s: UNetMetaGrad2D network to save
             meta_optimizer: Meta-optimizer (Adam) for meta-learner parameters
             iteration: Current iteration (for naming)
             meta_loss: Current meta-loss value
             meta_loss_history: Optional history of meta-losses
-            
+            filename: Optional explicit filename (e.g. "meta_learner_best.pt").
+                Defaults to "meta_learner_iter{iteration}.pt".
+
         Returns:
             Path to saved checkpoint
         """
-        checkpoint_path = self.meta_learner_dir / f"meta_learner_iter{iteration}.pt"
-        
+        return self.save_meta_learner_state(
+            network_s_state=network_s.state_dict(),
+            meta_optimizer_state=meta_optimizer.state_dict(),
+            iteration=iteration,
+            meta_loss=meta_loss,
+            meta_loss_history=meta_loss_history,
+            filename=filename,
+        )
+
+    def save_meta_learner_state(
+        self,
+        network_s_state: Dict,
+        meta_optimizer_state: Optional[Dict],
+        iteration: int,
+        meta_loss: float,
+        meta_loss_history: list = None,
+        filename: Optional[str] = None,
+    ) -> Path:
+        """
+        Save a meta-learner checkpoint from raw state dicts (e.g. a cached
+        best-loss snapshot taken mid-training, rather than the live network).
+
+        Args:
+            network_s_state: network_s.state_dict()
+            meta_optimizer_state: meta_optimizer.state_dict(), or None
+            iteration: Iteration this state corresponds to (for naming/metadata)
+            meta_loss: Meta-loss value at this state
+            meta_loss_history: Optional history of meta-losses
+            filename: Optional explicit filename. Defaults to
+                "meta_learner_iter{iteration}.pt".
+
+        Returns:
+            Path to saved checkpoint
+        """
+        checkpoint_path = self.meta_learner_dir / (filename or f"meta_learner_iter{iteration}.pt")
+
         checkpoint_data = {
             "iteration": iteration,
-            "network_s_state": network_s.state_dict(),
-            "meta_optimizer_state": meta_optimizer.state_dict(),
+            "network_s_state": network_s_state,
+            "meta_optimizer_state": meta_optimizer_state,
             "meta_loss": meta_loss,
             "meta_loss_history": meta_loss_history or [],
         }
-        
+
         torch.save(checkpoint_data, checkpoint_path)
         logger.info(f"Saved meta-learner checkpoint: {checkpoint_path}")
-        
+
         return checkpoint_path
     
     def load_meta_learner(
