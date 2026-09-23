@@ -367,45 +367,10 @@ class BiLevelICOptimizer:
             #     # This is the natural gradient flow we want
 
             if self.meta_one_task:
-                if self.hybrid_input:
-                    # NEW: Hybrid mode - use IC + gradient + iteration
-                    # Standardize IC by IC statistics, gradient by gradient statistics
-                    x_standardized = (x_det - self._channel_offset(x_det)) / self._channel_scale(x_det)
-                    gradient_standardized = (
-                        gradient_prev - self._broadcast_channels(gradient_mean, gradient_prev)
-                    ) / self._broadcast_channels(gradient_std, gradient_prev)
-                    
-                    # Concatenate IC and gradient along channel dimension: [B, T, 2*C, H, W]
-                    hybrid_input = torch.cat([x_standardized, gradient_standardized], dim=2)
-                    
-                    # Pass to network with iteration
-                    ic_update_standardized = self.predict_update(
-                        hybrid_input, 
-                        iteration=iteration,
-                    )
-                    
-                    # Destandardize using IC statistics (output is an IC update)
-                    # ic_update = (
-                    #     ic_update_standardized * self._channel_scale(ic_update_standardized)
-                    # ) + self._channel_offset(ic_update_standardized)
-                    ic_update = (
-                        ic_update_standardized * self._broadcast_channels(gradient_std, gradient_prev) 
-                        ) + self._broadcast_channels(gradient_mean, gradient_prev)
-                else:
-                    # EXISTING: Gradient-only mode
-                    # Standardize gradient
-                    gradient_standardized = (
-                        gradient_prev - self._broadcast_channels(gradient_mean, gradient_prev)
-                    ) / self._broadcast_channels(gradient_std, gradient_prev)
-                    # Gradient input mode: pass gradient and iteration
-                    ic_update_standardized = self.predict_update(
-                        gradient_standardized,  # Pass gradient instead of IC
-                        iteration=iteration,  # Pass iteration k
-                    )
-                    # Return in gradient field
-                    ic_update = (
-                        ic_update_standardized * self._broadcast_channels(gradient_std, gradient_prev) 
-                        ) + self._broadcast_channels(gradient_mean, gradient_prev)
+                # Gradient-only or hybrid (IC + gradient) input, conditioned on iteration
+                ic_update, gradient_standardized = self.one_task_update(
+                    x_det, gradient_prev, gradient_mean, gradient_std, iteration
+                )
 
             else:
                 # Original IC input mode
@@ -721,6 +686,51 @@ class BiLevelICOptimizer:
         if value.dim() == 4:
             return self.channel_mean.view(1, -1, 1, 1)
         raise ValueError(f"Expected a 4D or 5D tensor, got shape {value.shape}")
+
+    def one_task_update(
+        self,
+        x: torch.Tensor,
+        gradient: torch.Tensor,
+        gradient_mean: torch.Tensor,
+        gradient_std: torch.Tensor,
+        iteration: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict the IC update in meta_one_task mode (gradient-only or hybrid input).
+
+        Shared by training (step) and inference so both build the network input
+        identically.
+
+        Args:
+            x: [B, T, C, H, W] current IC state (only used when hybrid_input=True)
+            gradient: [B, T, C, H, W] outer-loop gradient ∇_x J
+            gradient_mean: Per-channel gradient mean
+            gradient_std: Per-channel gradient std
+            iteration: Outer-loop iteration k
+
+        Returns:
+            ic_update: [B, T, C, H, W] update in gradient space (x_new = x - ic_update)
+            gradient_standardized: [B, T, C, H, W] standardized gradient
+        """
+        gradient_standardized = (
+            gradient - self._broadcast_channels(gradient_mean, gradient)
+        ) / self._broadcast_channels(gradient_std, gradient)
+
+        if self.hybrid_input:
+            # Standardize IC by IC statistics, gradient by gradient statistics
+            x_standardized = (x - self._channel_offset(x)) / self._channel_scale(x)
+            # Concatenate IC and gradient along channel dimension: [B, T, 2*C, H, W]
+            x_in = torch.cat([x_standardized, gradient_standardized], dim=2)
+        else:
+            x_in = gradient_standardized
+
+        ic_update_standardized = self.predict_update(x_in, iteration=iteration)
+
+        # Destandardize using gradient statistics
+        ic_update = (
+            ic_update_standardized * self._broadcast_channels(gradient_std, gradient)
+        ) + self._broadcast_channels(gradient_mean, gradient)
+        return ic_update, gradient_standardized
 
     def predict_update(
         self,

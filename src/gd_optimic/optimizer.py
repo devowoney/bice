@@ -407,8 +407,11 @@ class ICOptimizer:
             self.use_meta_learner
             and self.meta_learner_config.get("mode", "training") == "inference"
         )
+        # meta_one_task networks take the outer-loop gradient (+ iteration) as input,
+        # so their inference goes through the gradient computation below.
+        one_task_inference = inference_mode and self.meta_learner.meta_one_task
         for iteration in range(self.num_iterations):
-            if inference_mode:
+            if inference_mode and not one_task_inference:
                 with torch.no_grad():
                     x_outer_before = x0_current
                     for _ in range(self.meta_learner_config.get("num_meta_steps", 10)):
@@ -503,6 +506,22 @@ class ICOptimizer:
                     x0_current = x0_current - ic_update
                     # Ensure x0_current requires grad for next iteration
                     x0_current = x0_current.detach().requires_grad_(True)
+            elif one_task_inference:
+                # Frozen meta-learner: same inner loop as step() (fixed outer gradient,
+                # iteration k), without the meta-optimization.
+                with torch.no_grad():
+                    x_outer_before = x0_current.detach()
+                    x_inner = x_outer_before
+                    gradient_mean, gradient_std = self.meta_learner._get_gradient_statistics(masked_gradients)
+                    for _ in range(self.meta_learner.num_meta_steps):
+                        ic_update, _ = self.meta_learner.one_task_update(
+                            x_inner, masked_gradients, gradient_mean, gradient_std, iteration
+                        )
+                        x_inner = x_inner - ic_update
+                    _, y_hat_steps = self.forward_model.forward(x_inner, num_forecast_steps)
+                    loss, loss_details = self.loss_fn(y_hat_steps, target_sequence, return_details=True)
+                    self._last_ic_update = (x_outer_before - x_inner).cpu().clone()
+                x0_current = x_inner.detach().requires_grad_(True)
             else:
                 # Train the meta-learner from the current outer-loop state.
                 self.meta_learner.target_sequence = target_sequence
@@ -561,7 +580,7 @@ class ICOptimizer:
                 # Cache network_s weights in memory (cheap CPU copy, no disk I/O)
                 # so the true best-loss meta-learner state can be persisted at the
                 # end of the run even if it doesn't land on a save_frequency boundary.
-                if self.use_meta_learner and self.meta_learner is not None:
+                if self.use_meta_learner and self.meta_learner is not None and not inference_mode:
                     self.best_network_s_state = {
                         k: v.detach().cpu().clone()
                         for k, v in self.meta_learner.network_s.state_dict().items()
@@ -631,8 +650,8 @@ class ICOptimizer:
             if (iteration + 1) % self.save_frequency == 0 or is_last_iteration:
                 self._save_checkpoint(iteration + 1, x0_current, y_hat_steps)
 
-                # Save meta-learner checkpoint if enabled
-                if self.use_meta_learner and self.meta_learner is not None:
+                # Save meta-learner checkpoint if enabled (frozen in inference: nothing new to save)
+                if self.use_meta_learner and self.meta_learner is not None and not inference_mode:
                     self.checkpoint_manager.save_meta_learner(
                         network_s=self.meta_learner.network_s,
                         meta_optimizer=self.meta_learner.meta_optimizer,
