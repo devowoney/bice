@@ -52,7 +52,7 @@ model:
   location: "/Odyssey/public/glonet/TrainedWeights"
   checkpoint_files:
     part1: "glonet_part1.pth"  # Surface model (5 channels)
-  use_gradient_checkpointing: true  # Memory-efficient backprop
+  use_gradient_checkpointing: false  # Memory-efficient backprop
 
   # Optional: per-block inner-checkpoint override inside GlonetGradientCheckpointing
   # (only applies when use_gradient_checkpointing is true). Omit this whole section to

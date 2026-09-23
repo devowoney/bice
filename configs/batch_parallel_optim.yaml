@@ -161,16 +161,16 @@ optimization:
     initial_kernel: 24  # Starting kernel size (coarse)
     final_kernel: 1     # Ending kernel size (fine)
     schedule_steps:     # Iterations to change kernel
-      - 30
-      - 60
-      - 90
-      - 120
+      - 50
+      - 100
       - 150
-      - 180
-      - 210
-      - 240
-      - 270
+      - 200
+      - 250
       - 300
+      - 350
+      - 400
+      - 450
+      - 500
     kernel_sizes:       # Corresponding kernel sizes at each step
       - 24  # [0, 100)
       - 8   # [100, 200)
@@ -182,7 +182,7 @@ optimization:
       - 4   # [700, 800) - coarsen again
       - 1   # [800, 900)
       - 2   # [900, 1000)
-      - 4   # [1000+]
+      - 1   # [1000+]
 
 # Metrics configuration (follows R4 decisions)
 metrics:
