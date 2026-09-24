@@ -367,45 +367,10 @@ class BiLevelICOptimizer:
             #     # This is the natural gradient flow we want
 
             if self.meta_one_task:
-                if self.hybrid_input:
-                    # NEW: Hybrid mode - use IC + gradient + iteration
-                    # Standardize IC by IC statistics, gradient by gradient statistics
-                    x_standardized = (x_det - self._channel_offset(x_det)) / self._channel_scale(x_det)
-                    gradient_standardized = (
-                        gradient_prev - self._broadcast_channels(gradient_mean, gradient_prev)
-                    ) / self._broadcast_channels(gradient_std, gradient_prev)
-                    
-                    # Concatenate IC and gradient along channel dimension: [B, T, 2*C, H, W]
-                    hybrid_input = torch.cat([x_standardized, gradient_standardized], dim=2)
-                    
-                    # Pass to network with iteration
-                    ic_update_standardized = self.predict_update(
-                        hybrid_input, 
-                        iteration=iteration,
-                    )
-                    
-                    # Destandardize using IC statistics (output is an IC update)
-                    # ic_update = (
-                    #     ic_update_standardized * self._channel_scale(ic_update_standardized)
-                    # ) + self._channel_offset(ic_update_standardized)
-                    ic_update = (
-                        ic_update_standardized * self._broadcast_channels(gradient_std, gradient_prev) 
-                        ) + self._broadcast_channels(gradient_mean, gradient_prev)
-                else:
-                    # EXISTING: Gradient-only mode
-                    # Standardize gradient
-                    gradient_standardized = (
-                        gradient_prev - self._broadcast_channels(gradient_mean, gradient_prev)
-                    ) / self._broadcast_channels(gradient_std, gradient_prev)
-                    # Gradient input mode: pass gradient and iteration
-                    ic_update_standardized = self.predict_update(
-                        gradient_standardized,  # Pass gradient instead of IC
-                        iteration=iteration,  # Pass iteration k
-                    )
-                    # Return in gradient field
-                    ic_update = (
-                        ic_update_standardized * self._broadcast_channels(gradient_std, gradient_prev) 
-                        ) + self._broadcast_channels(gradient_mean, gradient_prev)
+                # Gradient-only or hybrid (IC + gradient) input, conditioned on iteration
+                ic_update, ic_update_standardized, gradient_standardized = self.one_task_update(
+                    x_det, gradient_prev, gradient_mean, gradient_std, iteration
+                )
 
             else:
                 # Original IC input mode
@@ -478,19 +443,25 @@ class BiLevelICOptimizer:
             # The statistics are detached: no gradient is propagated through
             # the target normalization.
             if self.meta_one_task:
-                gradient_standardized = gradient_standardized
-                predicted_gradient_standardized = ic_update
+                # Compare in standardized space: network output s is bounded to
+                # ±output_scale by tanh, so rescale it to match the unit-std target.
+                predicted_gradient_standardized = ic_update_standardized / self.network_s.output_scale
+                # Ocean points only (land output is masked to 0, land target is -mean/std)
+                align_mask = self._ocean_mask_like(ic_update_standardized).expand_as(ic_update_standardized)
+                l_align = (
+                    (gradient_standardized - predicted_gradient_standardized).pow(2) * align_mask
+                ).sum() / align_mask.sum().clamp_min(1.0)
             else:
                 gradient_standardized = (
                     gradient_prev - self._broadcast_channels(gradient_mean, gradient_prev)
                 ) / self._broadcast_channels(gradient_std, gradient_prev)
-                
+
                 # For gradient-only and original modes: ic_update is already in gradient space
                 predicted_gradient_standardized = (
                     ic_update - self._broadcast_channels(gradient_mean, ic_update)
                 ) / self._broadcast_channels(gradient_std, ic_update)
 
-            l_align = (gradient_standardized - predicted_gradient_standardized).pow(2).mean()
+                l_align = (gradient_standardized - predicted_gradient_standardized).pow(2).mean()
             l_perf = (
                 loss_current.mean() if loss_current is not None and loss_current.dim() > 0 else loss_current
             )
@@ -597,14 +568,12 @@ class BiLevelICOptimizer:
                 last_l_perf = float(l_perf_weighted.detach().cpu().item())
             last_l_reg = float(l_reg_weighted.detach().cpu().item())
             
-            # For original mode, cache alignment-related values
+            # Cache alignment-related values (both modes use l_align)
+            last_l_align = float(l_align_weighted.detach().cpu().item())
             if self.meta_general_training:
                 last_l_combined = float(l_combined.detach().cpu().item())
-                last_l_align = float(l_align_weighted.detach().cpu().item())
             else:
-                # For gradient input mode, no alignment loss
                 last_l_combined = last_l_perf + last_l_reg
-                last_l_align = 0.0
 
             # TensorBoard logging
             if self.writer is not None:
@@ -613,7 +582,10 @@ class BiLevelICOptimizer:
                 self.writer.add_scalar(f"meta_steps/L_reg", last_l_reg, global_step)
                 self.writer.add_scalar(f"meta_steps/grad_norm", grad_norm, global_step)
                 self.writer.add_scalar(f"meta_steps/cosine_similarity", last_cosine_sim, global_step)
-                
+                if self.meta_one_task:
+                    self.writer.add_scalar(f"meta_steps/L_align", last_l_align, global_step)
+                    self.writer.add_scalar(f"meta_steps/phase", {"ALIGN": 0, "TRANS": 1, "PERF": 2}[phase_name], global_step)
+
                 # Log alignment-related metrics only for original mode
                 if self.meta_general_training:
                     self.writer.add_scalar(f"meta_steps/l_combined", last_l_combined, global_step)
@@ -624,8 +596,8 @@ class BiLevelICOptimizer:
                 if self.meta_one_task:
                     mode_str = "Hybrid Input" if self.hybrid_input else "Gradient Input"
                     logger.info(
-                        f"Meta-step {m+1}/{self.num_meta_steps} ({mode_str}): "
-                        f"L_perf={last_l_perf:.6f}, L_reg={last_l_reg:.6e}, "
+                        f"Meta-step {m+1}/{self.num_meta_steps} ({mode_str}, {phase_name}): "
+                        f"L_align={last_l_align:.6f}, L_perf={last_l_perf:.6f}, L_reg={last_l_reg:.6e}, "
                         f"cosine_sim={last_cosine_sim:.4f}")
                 else:
                     logger.info(
@@ -663,10 +635,10 @@ class BiLevelICOptimizer:
             "_final_y_hat_steps": final_y_hat_steps,
         }
         
-        # Add alignment-related diagnostics only for original mode
+        # Add alignment-related diagnostics
+        diagnostics["L_align"] = last_l_align
         if self.meta_general_training:
             diagnostics["L_combined"] = last_l_combined
-            diagnostics["L_align"] = last_l_align
 
         return diagnostics
 
@@ -722,6 +694,63 @@ class BiLevelICOptimizer:
             return self.channel_mean.view(1, -1, 1, 1)
         raise ValueError(f"Expected a 4D or 5D tensor, got shape {value.shape}")
 
+    def one_task_update(
+        self,
+        x: torch.Tensor,
+        gradient: torch.Tensor,
+        gradient_mean: torch.Tensor,
+        gradient_std: torch.Tensor,
+        iteration: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Predict the IC update in meta_one_task mode (gradient-only or hybrid input).
+
+        Shared by training (step) and inference so both build the network input
+        identically.
+
+        Args:
+            x: [B, T, C, H, W] current IC state (only used when hybrid_input=True)
+            gradient: [B, T, C, H, W] outer-loop gradient ∇_x J
+            gradient_mean: Per-channel gradient mean
+            gradient_std: Per-channel gradient std
+            iteration: Outer-loop iteration k
+
+        Returns:
+            ic_update: [B, T, C, H, W] update in gradient space (x_new = x - ic_update)
+            ic_update_standardized: [B, T, C, H, W] raw network output s (standardized, bounded by output_scale)
+            gradient_standardized: [B, T, C, H, W] standardized gradient
+        """
+        gradient_standardized = (
+            gradient - self._broadcast_channels(gradient_mean, gradient)
+        ) / self._broadcast_channels(gradient_std, gradient)
+
+        if self.hybrid_input:
+            # Standardize IC by IC statistics, gradient by gradient statistics
+            x_standardized = (x - self._channel_offset(x)) / self._channel_scale(x)
+            # Concatenate IC and gradient along channel dimension: [B, T, 2*C, H, W]
+            x_in = torch.cat([x_standardized, gradient_standardized], dim=2)
+        else:
+            x_in = gradient_standardized
+
+        ic_update_standardized = self.predict_update(x_in, iteration=iteration)
+
+        # Destandardize using gradient statistics
+        ic_update = (
+            ic_update_standardized * self._broadcast_channels(gradient_std, gradient)
+        ) + self._broadcast_channels(gradient_mean, gradient)
+        return ic_update, ic_update_standardized, gradient_standardized
+
+    def _ocean_mask_like(self, value: torch.Tensor) -> torch.Tensor:
+        """Broadcast self.ocean_mask ([C, H, W] or [1, C, H, W]) over a 4D or 5D field."""
+        mask = self.ocean_mask if self.ocean_mask.dim() == 4 else self.ocean_mask.unsqueeze(0)
+        if mask.dim() != 4:
+            raise ValueError(f"Unexpected ocean_mask shape: {self.ocean_mask.shape}")
+        if value.dim() == 5:
+            return mask.unsqueeze(0)  # [1, 1, C, H, W]
+        if value.dim() == 4:
+            return mask  # [1, C, H, W]
+        raise ValueError(f"Unexpected update tensor shape: {value.shape}")
+
     def predict_update(
         self,
         x: torch.Tensor,
@@ -764,15 +793,15 @@ class BiLevelICOptimizer:
         if self.meta_one_task:
             # Gradient input mode: x is gradient, use iteration k
             # No standardization needed, network takes raw gradient + iteration
-            predicted_gradient_standardized = self.network_s(x_in, iteration)
+            predicted_update_standardized = self.network_s(x_in, iteration)
         else:
             # Original IC input mode: standardize and predict
             x_standardized = (x_in - self._channel_offset(x_in)) / self._channel_scale(x_in)
-            predicted_gradient_standardized = self.network_s(x_standardized)
+            predicted_update_standardized = self.network_s(x_standardized)
         
         if self.meta_one_task:
             # Gradient input mode: output is already the update (no destandardization needed)
-            update = predicted_gradient_standardized
+            update = predicted_update_standardized
         else:
             # Original IC input mode: destandardize the prediction
             if target_gradient is not None and (gradient_mean is None or gradient_std is None):
@@ -780,42 +809,19 @@ class BiLevelICOptimizer:
                     target_gradient.to(self.device).detach()
                 )
             if inference:
-                update = predicted_gradient_standardized * self._channel_scale(
-                    predicted_gradient_standardized
+                update = predicted_update_standardized * self._channel_scale(
+                    predicted_update_standardized
                 )
             elif gradient_mean is None or gradient_std is None:
                 raise ValueError("gradient_mean and gradient_std are required to destandardize the prediction")
             else:
                 update = (
-                    predicted_gradient_standardized * self._broadcast_channels(gradient_std, predicted_gradient_standardized)
-                    + self._broadcast_channels(gradient_mean, predicted_gradient_standardized)
+                    predicted_update_standardized * self._broadcast_channels(gradient_std, predicted_update_standardized)
+                    + self._broadcast_channels(gradient_mean, predicted_update_standardized)
                 )
 
         # Apply ocean mask: self.ocean_mask may be [C, H, W] or [1, C, H, W]
-        if update.dim() == 5:
-            # [B, T, C, H, W] -> need mask shape [1, 1, C, H, W]
-            if self.ocean_mask.dim() == 3:
-                # [C, H, W] -> [1, 1, C, H, W]
-                mask = self.ocean_mask.view(1, 1, *self.ocean_mask.shape)
-            elif self.ocean_mask.dim() == 4:
-                # [1, C, H, W] -> [1, 1, C, H, W]
-                mask = self.ocean_mask.unsqueeze(0)
-            else:
-                raise ValueError(f"Unexpected ocean_mask shape: {self.ocean_mask.shape}")
-        elif update.dim() == 4:
-            # [B, C, H, W] -> need mask shape [1, C, H, W]
-            if self.ocean_mask.dim() == 3:
-                # [C, H, W] -> [1, C, H, W]
-                mask = self.ocean_mask.unsqueeze(0)
-            elif self.ocean_mask.dim() == 4:
-                # [1, C, H, W] -> use as-is
-                mask = self.ocean_mask
-            else:
-                raise ValueError(f"Unexpected ocean_mask shape: {self.ocean_mask.shape}")
-        else:
-            raise ValueError(f"Unexpected update tensor shape: {update.shape}")
-
-        update = update * mask
+        update = update * self._ocean_mask_like(update)
 
         if was_single:
             return update.squeeze(0)
