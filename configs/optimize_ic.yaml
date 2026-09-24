@@ -64,7 +64,7 @@ model:
   #   predictions:  true   # only disable with extra memory margin: +~59GB peak, ~2.5% faster
   inner_checkpoint_blocks:
     spatial: true
-    latent: false
+    latent: true
     temporal: true
     predictions: true
 

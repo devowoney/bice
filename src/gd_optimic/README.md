@@ -96,7 +96,9 @@ configs/optimize_ic.yaml  # Hydra configuration
 ```
 loss/J_obs/{total,ssh,sst,uo,vo}
 metrics/rmse/{global,basin}/{var}
-metrics/finite_difference_ic_update/{total,per_channel}
+diag/checkerboard/fraction/{step,cumulative}/{total,var}   # IC-update pixelization, 0 smooth / 0.25 noise / 1 checker
+diag/checkerboard/fraction/{step,cumulative}/ref_{physical,threshold}   # constants 0.038 / 0.063 (Custom Scalars tab overlays them)
+diag/checkerboard/amplitude/{step,cumulative}/{var}        # RMS checkerboard coefficient, physical units
 state/ic/{norm,update_magnitude}
 ```
 

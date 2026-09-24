@@ -31,7 +31,12 @@ from .utils import ForwardModel, MaskBuilder
 logger = logging.getLogger(__name__)
 from .loss import ObservationLoss
 from .gradient import GradientFilter, ScheduledPooling
-from .metrics import MetricsComputer
+from .metrics import (
+    MetricsComputer,
+    compute_checkerboard_fraction,
+    CHECKERBOARD_PHYSICAL_LEVEL,
+    CHECKERBOARD_THRESHOLD,
+)
 from .output_handler import OutputHandler
 from .meta_learner import BiLevelICOptimizer, UNetMetaGrad2D, NetworkSConfig, MetaLearnerCheckpointManager
 import xarray as xr
@@ -192,7 +197,19 @@ class ICOptimizer:
 
         # Initialize TensorBoard writer for this experiment
         self.writer = SummaryWriter(log_dir=str(self.tensorboard_dir))
-        
+
+        # Custom Scalars tab: overlay total checkerboard fraction with its reference lines
+        # (physical level, threshold) in one chart per scope.
+        self.writer.add_custom_scalars({
+            "Pixelization (checkerboard)": {
+                f"{scope} total vs reference": [
+                    "Multiline",
+                    [rf"diag/checkerboard/fraction/{scope}/(total|ref_physical|ref_threshold)$"],
+                ]
+                for scope in ("step", "cumulative")
+            }
+        })
+
         # Initialize output handler for NetCDF diagnostics
         self.output_handler = OutputHandler(
             exp_dir=self.exp_dir,
@@ -603,17 +620,16 @@ class ICOptimizer:
             if self.use_meta_learner and history_meta_loss is not None:
                 history_entry["meta_loss"] = history_meta_loss
 
+            # Pixelization diagnostic on the step IC update (last IC timestep, [C, H, W]).
             # Computed once here (used by history_entry unconditionally, and passed
-            # to _log_to_tensorboard below when logging -- avoids recomputing the
-            # identical (self._last_ic_update, self._ocean_mask) finite-difference
-            # a second time on the same inputs).
-            step_finite_diff = None
+            # to _log_to_tensorboard below when logging -- avoids recomputing it).
+            step_checkerboard = None
             if self._last_ic_update is not None and self._ocean_mask is not None:
-                step_finite_diff = self._compute_finite_difference_ic_update(
+                step_checkerboard = compute_checkerboard_fraction(
                     self._last_ic_update[0, -1],
-                    self._ocean_mask.detach().cpu(),
+                    self._ocean_mask,
                 )
-                history_entry["gradient_finite_difference_ic_update"] = step_finite_diff[0]
+                history_entry["checkerboard_fraction"] = step_checkerboard["fraction"]
 
             if regional_masks is not None:
                 history_entry["rmse_basin"] = metrics["rmse_basin"]
@@ -630,7 +646,7 @@ class ICOptimizer:
                     current_kernel,
                     x0_current=x0_current,
                     x0_reference=x0_reference,
-                    step_finite_diff=step_finite_diff,
+                    step_checkerboard=step_checkerboard,
                 )
 
             # Log histograms/embeddings less frequently
@@ -706,7 +722,7 @@ class ICOptimizer:
         kernel_size: int,
         x0_current: Optional[torch.Tensor] = None,
         x0_reference: Optional[torch.Tensor] = None,
-        step_finite_diff: Optional[Tuple[float, Dict]] = None,
+        step_checkerboard: Optional[Dict[str, Dict[str, float]]] = None,
     ):
         """
         Log metrics to TensorBoard.
@@ -716,9 +732,9 @@ class ICOptimizer:
         metrics/rmse/{global,basin}/{var}
         state/ic/{norm,update_magnitude}
 
-        step_finite_diff: optional (total, per_channel) tuple already computed by the
-        caller for (self._last_ic_update, self._ocean_mask) -- passed in to avoid
-        recomputing the identical finite-difference a second time here.
+        step_checkerboard: optional compute_checkerboard_fraction() result already computed
+        by the caller for (self._last_ic_update, self._ocean_mask) -- passed in to avoid
+        recomputing the identical diagnostic a second time here.
         """
         # Loss metrics (per-variable)
         per_var = loss_details["weighted_per_variable"]
@@ -753,41 +769,40 @@ class ICOptimizer:
         for var, rmse in metrics["ic_rmse"].items():
             self.writer.add_scalar(f"metrics/ic_rmse/{var}", rmse, iteration)
 
-        # Finite-difference IC update norm on the step correction field
-        if step_finite_diff is not None:
-            finite_diff_total, finite_diff_per_channel = step_finite_diff
-            self.writer.add_scalar(
-                "diag/finite_difference_ic_update/total",
-                finite_diff_total,
-                iteration,
-            )
-            for var, norm in finite_diff_per_channel.items():
-                self.writer.add_scalar(
-                    f"diag/finite_difference_ic_update/per_channel/{var}",
-                    norm,
-                    iteration,
-                )
+        # Pixelization (checkerboard) diagnostic on the step and cumulative IC update.
+        # fraction: 0 = smooth, 0.25 = white noise, 1 = pure checkerboard (dimensionless)
+        # amplitude: RMS checkerboard coefficient in each variable's physical units
+        if step_checkerboard is not None:
+            checkerboard_by_scope = {"step": step_checkerboard}
 
-            # Also measure the cumulative correction relative to the original IC.
+            # Cumulative correction relative to the original IC
             if x0_current is not None and x0_reference is not None:
                 cumulative_update = x0_current[0, -1] - x0_reference[0, -1]
-                cumulative_total, cumulative_per_channel = (
-                    self._compute_finite_difference_ic_update(
-                        cumulative_update,
-                        self._ocean_mask.detach().cpu(),
-                    )
+                checkerboard_by_scope["cumulative"] = compute_checkerboard_fraction(
+                    cumulative_update,
+                    self._ocean_mask,
                 )
+
+            for scope, result in checkerboard_by_scope.items():
+                for quantity in ("fraction", "amplitude"):
+                    for var, value in result[quantity].items():
+                        self.writer.add_scalar(
+                            f"diag/checkerboard/{quantity}/{scope}/{var}",
+                            value,
+                            iteration,
+                        )
+
+                # Constant reference lines for the total fraction (see metrics.py)
                 self.writer.add_scalar(
-                    "diag/finite_difference_ic_update/cumulative/total",
-                    cumulative_total,
+                    f"diag/checkerboard/fraction/{scope}/ref_physical",
+                    CHECKERBOARD_PHYSICAL_LEVEL,
                     iteration,
                 )
-                for var, norm in cumulative_per_channel.items():
-                    self.writer.add_scalar(
-                        f"diag/finite_difference_ic_update/cumulative/per_channel/{var}",
-                        norm,
-                        iteration,
-                    )
+                self.writer.add_scalar(
+                    f"diag/checkerboard/fraction/{scope}/ref_threshold",
+                    CHECKERBOARD_THRESHOLD,
+                    iteration,
+                )
 
         # Pooling kernel size
         self.writer.add_scalar("optimizer/pooling_kernel", kernel_size, iteration)
@@ -943,43 +958,6 @@ class ICOptimizer:
                 self.writer.add_histogram(
                     f"state/ic/{var_name}", ocean_points.detach().cpu().numpy(), iteration
                 )
-
-    def _compute_finite_difference_ic_update(
-        self,
-        field: torch.Tensor,
-        ocean_mask: torch.Tensor,
-    ) -> Tuple[float, Dict[str, float]]:
-        """Compute finite-difference IC update norms for a [C, H, W] field."""
-        var_names = ["SSH", "T", "S", "U", "V"]
-        total_sq = 0.0
-        per_channel = {}
-
-        for ch_idx, var_name in enumerate(var_names):
-            img = field[ch_idx]
-            mask = ocean_mask[ch_idx].to(img)
-
-            amplitude_sq = float((img.pow(2) * mask).sum().item())
-            finite_difference_sq = 0.0
-
-            if img.shape[1] > 1:
-                gx = img[:, 1:] - img[:, :-1]
-                gx_mask = mask[:, 1:] * mask[:, :-1]
-                finite_difference_sq += float((gx.pow(2) * gx_mask).sum().item())
-
-            if img.shape[0] > 1:
-                gy = img[1:, :] - img[:-1, :]
-                gy_mask = mask[1:, :] * mask[:-1, :]
-                finite_difference_sq += float((gy.pow(2) * gy_mask).sum().item())
-
-            # Divide by the field amplitude so uniformly scaling an update does
-            # not change its pixelization score.
-            channel_sq = (
-                finite_difference_sq / amplitude_sq if amplitude_sq > 0.0 else 0.0
-            )
-            per_channel[var_name] = float(np.sqrt(channel_sq))
-            total_sq += channel_sq
-
-        return float(np.sqrt(total_sq)), per_channel
 
     def _print_progress(self, iteration: int, loss: float, metrics: Dict, kernel_size: int):
         """

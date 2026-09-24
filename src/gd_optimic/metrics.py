@@ -3,7 +3,8 @@ Metrics computation for IC optimization evaluation.
 
 Provides:
     - MetricsComputer: Compute RMSE (global + basin-stratified) and PSD metrics
-    
+    - compute_checkerboard_fraction: Pixelization (checkerboard noise) diagnostic on IC updates
+
 Follows R4 decisions:
 - Per-variable RMSE (SSH, T, S, U, V)
 - Basin-stratified RMSE (Gulf Stream, high/low-variance, coastal)
@@ -19,6 +20,73 @@ import numpy as np
 import xarray as xr
 from typing import Dict, Tuple
 from scipy import signal
+
+
+# Reference levels for the total checkerboard fraction (TensorBoard reference lines).
+# Physical level: median total CF of GLORYS12 day-to-day increments (27 days, Jan 2021; p95 0.039).
+# Threshold: physical level + noise margin -> above it the IC update is considered pixelized.
+# Calibrated on the cumulative IC update (smoothed runs <= 0.062, unsmoothed runs >= 0.086).
+CHECKERBOARD_PHYSICAL_LEVEL = 0.038
+CHECKERBOARD_NOISE_MARGIN = 0.025
+CHECKERBOARD_THRESHOLD = CHECKERBOARD_PHYSICAL_LEVEL + CHECKERBOARD_NOISE_MARGIN
+
+
+def compute_checkerboard_fraction(
+    field: torch.Tensor,
+    ocean_mask: torch.Tensor,
+    var_names: Tuple[str, ...] = ("SSH", "T", "S", "U", "V"),
+) -> Dict[str, Dict[str, float]]:
+    """
+    Pixelization diagnostic: share of an IC update's energy in the grid-scale checkerboard mode.
+
+    Every overlapping 2x2 window [[a, b], [c, d]] is decomposed on the orthonormal 2x2 Hadamard
+    basis (mean, x-difference, y-difference, checkerboard). The checkerboard coefficient is
+        k = (a - b - c + d) / 2
+    and its energy is compared with the window energy a^2 + b^2 + c^2 + d^2 (= sum of the four
+    coefficients squared). Only windows with all four pixels on ocean are used, so coastlines
+    do not create spurious checkerboard energy.
+
+    Reading the fraction (dimensionless, invariant to update amplitude):
+        0     -> smooth update (physical)
+        0.25  -> white noise (no spatial structure at all)
+        1     -> pure checkerboard
+
+    Args:
+        field: IC update [C, H, W] (step or cumulative correction)
+        ocean_mask: Ocean mask [C, H, W] - 1=ocean, 0=land
+        var_names: Channel names, in channel order
+
+    Returns:
+        {
+            "fraction":  {var: checkerboard energy fraction, ..., "total": mean over channels},
+            "amplitude": {var: RMS checkerboard coefficient over ocean windows (physical units)},
+        }
+    """
+    mask = ocean_mask.to(field)
+
+    # Four corners of every overlapping 2x2 window: [C, H-1, W-1]
+    a, b = field[:, :-1, :-1], field[:, :-1, 1:]
+    c, d = field[:, 1:, :-1], field[:, 1:, 1:]
+    window_ok = mask[:, :-1, :-1] * mask[:, :-1, 1:] * mask[:, 1:, :-1] * mask[:, 1:, 1:]
+
+    checker_sq = (((a - b - c + d) / 2.0).pow(2) * window_ok).sum(dim=(-2, -1))  # [C]
+    energy = ((a.pow(2) + b.pow(2) + c.pow(2) + d.pow(2)) * window_ok).sum(dim=(-2, -1))  # [C]
+    n_windows = window_ok.sum(dim=(-2, -1))  # [C]
+
+    # Zero-energy channel (e.g. no update yet) -> fraction 0 instead of NaN
+    fraction = torch.where(energy > 0, checker_sq / energy.clamp_min(1e-30), torch.zeros_like(energy))
+    amplitude = torch.sqrt(checker_sq / n_windows.clamp_min(1.0))
+
+    # Single device->host transfer for all channels
+    fraction_list = fraction.detach().cpu().tolist()
+    amplitude_list = amplitude.detach().cpu().tolist()
+
+    fraction_dict = {var: fraction_list[ch] for ch, var in enumerate(var_names)}
+    # Channels carry different units, so the total averages the dimensionless fractions only
+    fraction_dict["total"] = float(np.mean(fraction_list))
+    amplitude_dict = {var: amplitude_list[ch] for ch, var in enumerate(var_names)}
+
+    return {"fraction": fraction_dict, "amplitude": amplitude_dict}
 
 
 class MetricsComputer:
