@@ -25,6 +25,7 @@
 #
 # Environment variables (optional):
 #   BATCH_SIZE: Number of optimization samples to run (default: 50)
+#   START_IDX: Index of the first sample (default: 0); runs START_IDX .. START_IDX+BATCH_SIZE-1
 #   OPT_PARAMS: Additional Hydra parameters for the parallel script
 #   LOG_LEVEL: Logging level (default: INFO)
 #
@@ -139,9 +140,12 @@ OPT_CONFIG="${OPT_CONFIG:-optimize_ic}"
 # Set default batch size (number of optimization samples)
 BATCH_SIZE="${BATCH_SIZE:-4}"  # Default: 50 samples
 
+# Set first sample index (samples START_IDX .. START_IDX+BATCH_SIZE-1 are processed)
+START_IDX="${START_IDX:-0}"
+
 # Set default parameters for parallel optimization
-PARAM1="experiment.name=parallel_mergeTest"
-PARAM2="data.batch_size=$BATCH_SIZE"  # This controls the total number of samples
+PARAM1="experiment.name=parallel_optim_test_outputFix"
+PARAM2="data.batch_size=$BATCH_SIZE data.sample_idx=$START_IDX"  # Total number of samples, from START_IDX
 PARAM3="optimization.num_iterations=20 \
         logging.save_frequency=10 \
         loss.weighting=manual"
@@ -171,7 +175,7 @@ echo "========================================================================"
 echo "Running Parallel Optimization"
 echo "========================================================================"
 echo "Command: $CMD"
-echo "Batch Size: $BATCH_SIZE samples"
+echo "Batch Size: $BATCH_SIZE samples (from index $START_IDX)"
 echo "Number of Tasks: $SLURM_NTASKS processes"
 echo "========================================================================"
 echo ""

@@ -175,7 +175,7 @@ def setup_reproducibility(seed: int = 42, global_rank: int = 0):
         torch.backends.cudnn.benchmark = False
 
 
-def get_batch_indices(total_batch_size: int, world_size: int, global_rank: int):
+def get_batch_indices(total_batch_size: int, world_size: int, global_rank: int, first_idx: int = 0):
     """
     Calculate start and end indices for this process's batch.
     
@@ -183,6 +183,7 @@ def get_batch_indices(total_batch_size: int, world_size: int, global_rank: int):
         total_batch_size: Total number of optimization problems
         world_size: Total number of processes
         global_rank: Current process rank
+        first_idx: Dataset index of the first sample (offset applied to all ranks)
         
     Returns:
         Tuple of (start_idx, end_idx) for this process's batch
@@ -199,7 +200,7 @@ def get_batch_indices(total_batch_size: int, world_size: int, global_rank: int):
         start_idx = global_rank * batch_size_per_process + remainder
         end_idx = start_idx + batch_size_per_process
     
-    return start_idx, end_idx
+    return first_idx + start_idx, first_idx + end_idx
 
 
 def run_optimization_on_batch(
@@ -556,12 +557,19 @@ def main(cfg: DictConfig):
         # Get total number of samples available
         total_samples = len(dataset.dataset.time)
         
-        # Use batch_size from config or default to total samples
-        total_batch_size = min(cfg.data.get("batch_size", total_samples), total_samples)
+        # First sample index: samples [first_idx, first_idx + batch_size) are processed
+        first_idx = cfg.data.get("sample_idx", 0)
+        if not 0 <= first_idx < total_samples:
+            raise ValueError(f"data.sample_idx={first_idx} out of range [0, {total_samples})")
+
+        # Use batch_size from config or default to remaining samples
+        total_batch_size = min(cfg.data.get("batch_size", total_samples), total_samples - first_idx)
         
         if global_rank == 0:
             logger.info(f"Total samples available: {total_samples}")
-            logger.info(f"Total batch size: {total_batch_size}")
+            logger.info(f"First sample index: {first_idx}")
+            logger.info(f"Total batch size: {total_batch_size} "
+                        f"(samples {first_idx} to {first_idx + total_batch_size - 1})")
 
         # -------------------------------------------------------------------------
         # 2. Initialize Shared Components
@@ -627,7 +635,7 @@ def main(cfg: DictConfig):
         # 3. Calculate Batch Indices for This Process
         # -------------------------------------------------------------------------
         batch_start_idx, batch_end_idx = get_batch_indices(
-            total_batch_size, world_size, global_rank
+            total_batch_size, world_size, global_rank, first_idx
         )
         
         if global_rank == 0:
