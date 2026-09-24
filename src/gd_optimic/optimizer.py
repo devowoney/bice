@@ -514,7 +514,7 @@ class ICOptimizer:
                     x_inner = x_outer_before
                     gradient_mean, gradient_std = self.meta_learner._get_gradient_statistics(masked_gradients)
                     for _ in range(self.meta_learner.num_meta_steps):
-                        ic_update, _ = self.meta_learner.one_task_update(
+                        ic_update, _, _ = self.meta_learner.one_task_update(
                             x_inner, masked_gradients, gradient_mean, gradient_std, iteration
                         )
                         x_inner = x_inner - ic_update
