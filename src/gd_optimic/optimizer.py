@@ -38,6 +38,7 @@ from .metrics import (
     CHECKERBOARD_THRESHOLD,
 )
 from .output_handler import OutputHandler
+from .ic_optimizer import build_ic_optimizer, resolve_ic_optimizer_lr
 from .meta_learner import BiLevelICOptimizer, UNetMetaGrad2D, NetworkSConfig, MetaLearnerCheckpointManager
 import xarray as xr
 
@@ -79,6 +80,8 @@ class ICOptimizer:
         use_meta_learner: bool = False,
         meta_learner_config: Optional[Dict] = None,
         downsampling_method: str = "average_pooling",
+        use_ic_optimizer: bool = False,
+        ic_optimizer_config: Optional[Dict] = None,
     ):
         """
         Initialize IC optimizer (standard gradient descent or meta-learning).
@@ -122,6 +125,13 @@ class ICOptimizer:
                   * Loss: w_perf * L_perf + [optional: weak l_align] + l_reg
                   * Goal: Make IC updates that actually improve forecasts
                   * Expected: L_perf DECREASES, improvement POSITIVE (forecasts get better)
+            use_ic_optimizer: Feature flag. Replace the constant-step update
+                (x <- x - learning_rate * masked_gradient) with a torch.optim optimizer
+                (Adam, SGD+momentum, ...) fed with the same masked gradient.
+                Only affects the standard (non-meta-learner) path. Default False.
+            ic_optimizer_config: Configuration dict for the IC optimizer (see
+                ic_optimizer.build_ic_optimizer): name, lr (null = learning_rate),
+                and optimizer-specific kwargs.
         """
         self.forward_model = forward_model
         self.loss_fn = loss_fn
@@ -164,6 +174,18 @@ class ICOptimizer:
             # BiLevelICOptimizer will be instantiated in optimize() once we know the IC shape
         else:
             logger.info("Using standard gradient descent (no meta-learner)")
+
+        # IC optimizer selection (feature flag); torch.optim instance built in optimize()
+        self.use_ic_optimizer = use_ic_optimizer
+        self.ic_optimizer_config = ic_optimizer_config or {}
+        self.ic_optimizer = None
+        if self.use_ic_optimizer:
+            if self.use_meta_learner:
+                logger.warning("use_ic_optimizer is ignored when use_meta_learner is enabled")
+            else:
+                logger.info(
+                    f"IC optimizer selection ENABLED: {self.ic_optimizer_config.get('name', 'adam')}"
+                )
 
         # Writer and output handler initialized later after exp_id is set
         self.writer = None
@@ -279,6 +301,13 @@ class ICOptimizer:
         # Number of forward steps to roll out (for assimilation window)
         num_forecast_steps = target_sequence.shape[1]
 
+        # IC optimizer (feature flag): x0_current stays the same leaf tensor for the
+        # whole run and is updated in place, so the optimizer state persists.
+        if self.use_ic_optimizer and not self.use_meta_learner:
+            self.ic_optimizer = build_ic_optimizer(
+                x0_current, self.ic_optimizer_config, self.learning_rate
+            )
+
         # Initialize meta-learner if enabled (Phase P)
         if self.use_meta_learner:
             logger.info("\nInitializing BiLevelICOptimizer ...")
@@ -389,6 +418,11 @@ class ICOptimizer:
         logger.info(f"Target sequence shape: {target_sequence.shape}")
         logger.info(f"Forecast steps: {num_forecast_steps}")
         logger.info(f"Learning rate: {self.learning_rate}")
+        if self.ic_optimizer is not None:
+            logger.info(
+                f"IC optimizer: {type(self.ic_optimizer).__name__} "
+                f"(lr={resolve_ic_optimizer_lr(self.ic_optimizer_config, self.learning_rate)})"
+            )
         if self.use_meta_learner:
             logger.info(f"Meta-learner: ENABLED (Phase P - Bi-level optimization)")
             logger.info(f"  Two-phase curriculum learning:")
@@ -514,8 +548,21 @@ class ICOptimizer:
             # Default history meta loss
             history_meta_loss = None
 
+            # IC optimizer (feature flag): torch.optim step on the masked gradient
+            if self.ic_optimizer is not None:
+                with torch.no_grad():
+                    x_before = x0_current.detach().clone()
+                    x0_current.grad = masked_gradients
+                    self.ic_optimizer.step()
+                    # Re-apply the ocean mask to the step: weight decay / momentum
+                    # must not move land points.
+                    ic_update = (x_before - x0_current) * ocean_mask.unsqueeze(0).unsqueeze(0)
+                    x0_current.copy_(x_before - ic_update)
+                    self._last_ic_update = ic_update.detach().cpu().clone()
+                    x0_current.grad = None
+                    del x_before
             # If meta-learner disabled: apply standard gradient descent update inside no_grad
-            if not self.use_meta_learner:
+            elif not self.use_meta_learner:
                 with torch.no_grad():
                     ic_update = self.learning_rate * masked_gradients
                     # Save last update on CPU for TensorBoard logging
@@ -807,6 +854,12 @@ class ICOptimizer:
         # Pooling kernel size
         self.writer.add_scalar("optimizer/pooling_kernel", kernel_size, iteration)
 
+        # IC optimizer step size (feature flag)
+        if self.ic_optimizer is not None:
+            self.writer.add_scalar(
+                "optimizer/ic_lr", self.ic_optimizer.param_groups[0]["lr"], iteration
+            )
+
         # IC correction/update visualizations (per-step and cumulative, coordinate-aware)
         # _last_ic_update: [B, T, C, H, W] on CPU
         if self._last_ic_update is not None and self._ocean_mask is not None:
@@ -886,8 +939,15 @@ class ICOptimizer:
                             ax.tick_params(labelsize=8)
                             fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
 
+                        if self.ic_optimizer is not None:
+                            update_rule = (
+                                f"IC update = {type(self.ic_optimizer).__name__}"
+                                "(filtered_gradient × ocean_mask) × ocean_mask"
+                            )
+                        else:
+                            update_rule = "IC update = learning_rate × filtered_gradient × ocean_mask"
                         legend_text = (
-                            "IC update = learning_rate × filtered_gradient × ocean_mask\n"
+                            f"{update_rule}\n"
                             f"Color shows the {update_kind} correction in physical units."
                         )
                         fig.text(
@@ -994,17 +1054,17 @@ class ICOptimizer:
         """
         checkpoint_path = self.checkpoint_dir / f"checkpoint_iter{iteration}.pt"
 
-        torch.save(
-            {
-                "iteration": iteration,
-                "x0": x0_current.detach().cpu(),
-                "predictions": predictions.detach().cpu(),
-                "loss": self.history[-1]["loss"],
-                "best_loss": self.best_loss,
-                "best_iteration": self.best_iteration,
-            },
-            checkpoint_path,
-        )
+        checkpoint = {
+            "iteration": iteration,
+            "x0": x0_current.detach().cpu(),
+            "predictions": predictions.detach().cpu(),
+            "loss": self.history[-1]["loss"],
+            "best_loss": self.best_loss,
+            "best_iteration": self.best_iteration,
+        }
+        if self.ic_optimizer is not None:
+            checkpoint["ic_optimizer_state"] = self.ic_optimizer.state_dict()
+        torch.save(checkpoint, checkpoint_path)
 
         logger.info(f"Saved checkpoint: {checkpoint_path}")
 

@@ -406,6 +406,8 @@ def main(cfg: DictConfig):
         forecast_horizon=cfg.data.forecast_horizon,
         use_meta_learner=cfg.optimization.get("use_meta_learner", False),
         meta_learner_config=dict(cfg.optimization.meta_learner) if cfg.optimization.get("use_meta_learner", False) else None,
+        use_ic_optimizer=cfg.optimization.get("use_ic_optimizer", False),
+        ic_optimizer_config=dict(cfg.optimization.ic_optimizer) if cfg.optimization.get("use_ic_optimizer", False) else None,
     )
     logger.info("Initialized optimizer")
 
