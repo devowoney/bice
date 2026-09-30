@@ -21,6 +21,7 @@ import torch
 import xarray as xr
 
 from .metrics import PSDComputer
+from .spectral_scores import save_effective_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -501,230 +502,6 @@ class OutputHandler:
         logger.info("Saved global EBCR and wavelength-domain PSD analyses.")
         return metadata
 
-    def _save_local_patch_ebcr(
-        self,
-        reference_forecast: torch.Tensor,
-        optimized_forecast: torch.Tensor,
-        ground_truth_sequence: torch.Tensor,
-        ocean_mask: torch.Tensor,
-        input_sequence: xr.Dataset,
-    ) -> Optional[Dict]:
-        """
-        Compute local-patch effective resolution from EBCR.
-
-        Patches are approximately 200 km wide. Within each patch, wavenumbers
-        are checked from finest to coarser scales and the smallest wavenumber
-        with EBCR < 1 is converted to a wavelength for global mapping.
-        """
-        ref = reference_forecast.squeeze(0).detach().cpu().numpy()
-        opt = optimized_forecast.squeeze(0).detach().cpu().numpy()
-        truth = ground_truth_sequence.squeeze(0).detach().cpu().numpy()
-        mask = ocean_mask.detach().cpu().numpy() > 0
-        horizon = min(ref.shape[0], opt.shape[0], truth.shape[0])
-        timesteps = list(range(self.PSD_ANALYSIS_TIMESTEP, horizon + 1, 7))
-        if not timesteps:
-            logger.warning("Skipping local EBCR: forecast horizon is shorter than t=7.")
-            return None
-
-        lat = input_sequence.coords["lat"].values
-        lon = input_sequence.coords["lon"].values
-        dlat = float(np.abs(lat[1] - lat[0])) if lat.size > 1 else 0.25
-        dlon = float(np.abs(lon[1] - lon[0])) if lon.size > 1 else 0.25
-        km_per_degree = 111.2
-        patch_km = 200.0
-        patch_height = max(2, int(round(patch_km / (km_per_degree * dlat))))
-
-        def _radial_curve(
-            kx: np.ndarray, ky: np.ndarray, power: np.ndarray, n_bins: int = 30
-        ) -> Tuple[np.ndarray, np.ndarray]:
-            """Return wavelength-sorted radial PSD values for one patch."""
-            kx_grid, ky_grid = np.meshgrid(kx, ky)
-            radial = np.sqrt(kx_grid**2 + ky_grid**2)
-            positive = radial > 0
-            if not np.any(positive):
-                return np.array([]), np.array([])
-            bins = np.logspace(
-                np.log10(radial[positive].min()),
-                np.log10(radial.max()),
-                n_bins + 1,
-            )
-            centers = np.sqrt(bins[:-1] * bins[1:])
-            values = np.full(n_bins, np.nan, dtype=np.float64)
-            for bin_idx in range(n_bins):
-                selected = (radial >= bins[bin_idx]) & (radial < bins[bin_idx + 1])
-                if np.any(selected):
-                    values[bin_idx] = np.nanmean(power[selected])
-            keep = np.isfinite(values) & (values > 0)
-            return 1.0 / centers[keep], values[keep]
-
-        def _patch_psd(field: np.ndarray, patch_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-            """Compute a radial PSD curve inside one local patch."""
-            if np.count_nonzero(patch_mask) < 4:
-                return np.array([]), np.array([])
-            return _radial_curve(
-                *self._compute_windowed_psd_grid(
-                    field, patch_mask, dlat, dlon
-                )
-            )  # type: ignore[arg-type]
-
-        all_results = {"timesteps": {}, "patch_size_km": patch_km}
-        csv_rows = []
-        for timestep in timesteps:
-            timestep_idx = timestep - 1
-            timestep_results = {}
-            for ch_idx, (var_name, _, _) in self.VAR_METADATA.items():
-                patch_results = []
-                figure, ax = plt.subplots(figsize=(14, 6), constrained_layout=True)
-                value_grid = np.full((len(lat), len(lon)), np.nan, dtype=np.float64)
-                for y0 in range(0, len(lat), patch_height):
-                    y1 = min(y0 + patch_height, len(lat))
-                    center_lat = float(np.mean(lat[y0:y1]))
-                    patch_width = max(
-                        2,
-                        int(round(patch_km / (
-                            km_per_degree * max(np.cos(np.deg2rad(center_lat)), 0.1) * dlon
-                        ))),
-                    )
-                    for x0 in range(0, len(lon), patch_width):
-                        x1 = min(x0 + patch_width, len(lon))
-                        patch_mask = mask[ch_idx, y0:y1, x0:x1]
-                        k_ref, psd_ref = _patch_psd(
-                            ref[timestep_idx, ch_idx, y0:y1, x0:x1], patch_mask
-                        )
-                        k_opt, psd_opt = _patch_psd(
-                            opt[timestep_idx, ch_idx, y0:y1, x0:x1], patch_mask
-                        )
-                        k_truth, psd_truth = _patch_psd(
-                            truth[timestep_idx, ch_idx, y0:y1, x0:x1], patch_mask
-                        )
-                        if (
-                            k_ref.size == 0
-                            or psd_opt.size == 0
-                            or psd_truth.size == 0
-                            or k_opt.size == 0
-                            or k_truth.size == 0
-                        ):
-                            continue
-                        # Different fields can lose different empty radial
-                        # bins; compare all spectra on the reference grid.
-                        if psd_opt.size != k_ref.size or not np.allclose(k_opt, k_ref):
-                            psd_opt = np.interp(
-                                k_ref[::-1],
-                                k_opt[::-1],
-                                psd_opt[::-1],
-                                left=np.nan,
-                                right=np.nan,
-                            )[::-1]
-                        if psd_truth.size != k_ref.size or not np.allclose(k_truth, k_ref):
-                            psd_truth = np.interp(
-                                k_ref[::-1],
-                                k_truth[::-1],
-                                psd_truth[::-1],
-                                left=np.nan,
-                                right=np.nan,
-                            )[::-1]
-                        ebcr = PSDComputer.compute_ebcr(psd_ref, psd_opt, psd_truth)
-                        wavelength_km = k_ref * km_per_degree
-                        valid = (
-                            np.isfinite(ebcr)
-                            & (ebcr < 1.0)
-                            & (wavelength_km >= self.EFFECTIVE_WAVELENGTH_MIN_KM)
-                            & (wavelength_km <= self.EFFECTIVE_WAVELENGTH_MAX_KM)
-                        )
-                        if not np.any(valid):
-                            continue
-
-                        # The effective cutoff is the smallest wavenumber that
-                        # still satisfies EBCR < 1.
-                        wavenumber = 1.0 / k_ref
-                        selected = np.flatnonzero(valid)
-                        selected = selected[np.argmin(wavenumber[selected])]
-                        effective_wavelength_deg = float(k_ref[selected])
-                        effective_wavelength_km = float(wavelength_km[selected])
-                        center_y = min((y0 + y1) // 2, len(lat) - 1)
-                        center_x = min((x0 + x1) // 2, len(lon) - 1)
-                        # Fill the full patch so neighboring patch values are
-                        # readable at global scale instead of appearing as dots.
-                        value_grid[y0:y1, x0:x1] = effective_wavelength_km
-                        patch_result = {
-                            "row": int(center_y),
-                            "column": int(center_x),
-                            "latitude": float(lat[center_y]),
-                            "longitude": float(lon[center_x]),
-                            "wavelength_km": effective_wavelength_km,
-                            "wavelength_deg": effective_wavelength_deg,
-                            "wavenumber_cycles_per_deg": float(1.0 / effective_wavelength_deg),
-                        }
-                        patch_results.append(patch_result)
-                        csv_rows.append({
-                            "run_id": self.run_id,
-                            "timestep": timestep,
-                            "variable": var_name,
-                            **patch_result,
-                        })
-
-                cmap = plt.get_cmap("RdBu_r").copy()
-                cmap.set_bad("#d3d3d3")
-                image = ax.imshow(
-                    np.ma.masked_invalid(value_grid),
-                    origin="lower" if lat[0] < lat[-1] else "upper",
-                    extent=(
-                        float(lon.min()),
-                        float(lon.max()),
-                        float(lat.min()),
-                        float(lat.max()),
-                    ),
-                    aspect="auto",
-                    cmap=cmap,
-                    vmin=self.EFFECTIVE_WAVELENGTH_MIN_KM,
-                    vmax=self.EFFECTIVE_WAVELENGTH_MAX_KM,
-                    interpolation="none",
-                )
-                figure.colorbar(image, ax=ax, label="Effective wavelength (km)")
-                ax.set_xlabel("Longitude")
-                ax.set_ylabel("Latitude")
-                ax.set_title(f"Local-patch effective resolution | {var_name} | t={timestep}")
-                plot_path = self.diagnostics_dir / (
-                    f"psd_local_patch_ebcr_{var_name}_t{timestep}.png"
-                )
-                figure.savefig(plot_path, dpi=200)
-                plt.close(figure)
-                timestep_results[var_name] = {
-                    "plot": str(plot_path.relative_to(self.exp_dir)),
-                    "patches": patch_results,
-                }
-            all_results["timesteps"][str(timestep)] = timestep_results
-
-        metadata = {
-            "run_id": self.run_id,
-            "timesteps": timesteps,
-            "patch_size_km": patch_km,
-            "wavelength_limits_km": {
-                "minimum": self.EFFECTIVE_WAVELENGTH_MIN_KM,
-                "maximum": self.EFFECTIVE_WAVELENGTH_MAX_KM,
-            },
-            "definition": "(psd_optimized - psd_truth) / (psd_reference - psd_truth)",
-            "selection": (
-                "smallest wavenumber with EBCR < 1, scanning from finest "
-                "to coarser scales, restricted to 65-500 km wavelength"
-            ),
-            "grid": {"dlat_deg": dlat, "dlon_deg": dlon},
-            "analysis": all_results,
-        }
-        with open(self.metrics_dir / "psd_local_patch_ebcr.json", "w") as f:
-            json.dump(metadata, f, indent=2)
-        with open(self.metrics_dir / "psd_local_patch_ebcr.csv", "w", newline="") as f:
-            fields = [
-                "run_id", "timestep", "variable", "row", "column",
-                "latitude", "longitude", "wavelength_km", "wavelength_deg",
-                "wavenumber_cycles_per_deg",
-            ]
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(csv_rows)
-        logger.info("Saved local-patch EBCR effective-resolution analysis.")
-        return metadata
-
     def save_outputs(
         self,
         x0_init: torch.Tensor,
@@ -797,12 +574,19 @@ class OutputHandler:
                 input_sequence=input_sequence,
                 mean_field=mean_field,
             )
-            ebcr_summary = self._save_local_patch_ebcr(
-                reference_forecast=reference_forecast,
-                optimized_forecast=full_forecast,
-                ground_truth_sequence=ground_truth_sequence,
-                ocean_mask=ocean_mask,
-                input_sequence=input_sequence,
+            # Effective resolution from pseudo-track spectra (replaces local-patch EBCR)
+            ebcr_summary = save_effective_resolution(
+                metrics_dir=self.metrics_dir,
+                diagnostics_dir=self.diagnostics_dir,
+                run_id=self.run_id,
+                reference=reference_forecast.squeeze(0).detach().cpu().numpy(),
+                optimized=full_forecast.squeeze(0).detach().cpu().numpy(),
+                truth=ground_truth_sequence.squeeze(0).detach().cpu().numpy(),
+                ocean_mask=ocean_mask.detach().cpu().numpy() > 0,
+                lat=input_sequence.coords["lat"].values,
+                lon=input_sequence.coords["lon"].values,
+                var_names=[self.VAR_METADATA[c][0] for c in sorted(self.VAR_METADATA)],
+                region_masks=regional_masks,
             )
 
             # Determine RMSE horizon from available forecasts/ground-truth (no separate global rmse figure)
@@ -864,20 +648,16 @@ class OutputHandler:
                             "rmse_evolution_csv": "metrics/rmse_evolution.csv",
                             "psd_analysis_json": "metrics/psd_analysis.json",
                             "psd_analysis_csv": "metrics/psd_analysis.csv",
-                            "psd_local_patch_ebcr_json": (
-                                "metrics/psd_local_patch_ebcr.json"
+                            **(
+                                {
+                                    "effective_resolution_json": "metrics/effective_resolution.json",
+                                    "effective_resolution_csv": "metrics/effective_resolution.csv",
+                                    "psd_segment_scores_csv": "metrics/psd_segment_scores.csv",
+                                    "effective_resolution_maps_nc": "metrics/effective_resolution_maps.nc",
+                                    "effective_resolution_map_plots": "diagnostics/effective_resolution_map_{variable}.png",
+                                }
                                 if ebcr_summary is not None
-                                else None
-                            ),
-                            "psd_local_patch_ebcr_csv": (
-                                "metrics/psd_local_patch_ebcr.csv"
-                                if ebcr_summary is not None
-                                else None
-                            ),
-                            "psd_local_patch_ebcr_plots": (
-                                "diagnostics/psd_local_patch_ebcr_{variable}_t{7,14,21,...}.png"
-                                if ebcr_summary is not None
-                                else None
+                                else {}
                             ),
                             "forecast_animation": "states/forecast_comparison.gif",
                             "forecast_animation_anomaly": "states/forecast_comparison_anomaly.gif",
