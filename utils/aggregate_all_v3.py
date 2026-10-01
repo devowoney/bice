@@ -8,6 +8,11 @@ Usage:
   python3 aggregate_all_v3.py dir1 dir2 dir3                 # Combine all runs from 3 dirs
   python3 aggregate_all_v3.py table1_* -o ./output           # Output to custom path
   python3 aggregate_all_v3.py table1_* table2_* --output ./out
+  python3 aggregate_all_v3.py .tmp/runs/parallel_table1_*    # Nested layouts are searched recursively
+
+Run discovery: every directory below each input that contains metrics/, states/
+or diagnostics/ is one run, at any depth (multiruns/<exp>/<N>/ as well as
+runs/parallel_<exp>/<timestamp>/gpu<G>_sample<S>/). Search stops at a run dir.
 
 Output: Single aggregated_metrics/, aggregated_states/, aggregated_diagnostics/
          with statistics computed across ALL input directories
@@ -36,6 +41,27 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 import warnings
 warnings.filterwarnings('ignore')
+
+# ============ RUN DISCOVERY ============
+RUN_MARKERS = ("metrics", "states", "diagnostics")
+
+def find_run_dirs(root):
+    """All run dirs at any depth below root (root included); no descent into a found run."""
+    if any((root / m).is_dir() for m in RUN_MARKERS):
+        return [root]
+    runs = []
+    for d in sorted(root.iterdir()):
+        if d.is_dir() and not d.name.startswith(('.', '__')):
+            runs.extend(find_run_dirs(d))
+    return runs
+
+def find_config(run_dir, max_up=2):
+    """Nearest config.yaml: the run's own, else up to max_up ancestors' (or their .hydra/), e.g. parallel runs."""
+    for d in (run_dir, *list(run_dir.parents)[:max_up]):
+        for c in (d / "config.yaml", d / ".hydra" / "config.yaml"):
+            if c.exists():
+                return c
+    return None
 
 # ============ CSV AGGREGATION (FIXED) ============
 
@@ -449,8 +475,8 @@ def _read_observation_length(all_run_dirs):
     import yaml
     lengths = set()
     for run_dir in all_run_dirs:
-        cfg_path = run_dir / "config.yaml"
-        if cfg_path.exists():
+        cfg_path = find_config(run_dir)
+        if cfg_path:
             try:
                 with open(cfg_path) as f:
                     lengths.add(int(yaml.safe_load(f)['data']['observation_length']))
@@ -856,13 +882,15 @@ def main():
     # Collect ALL runs from ALL parent directories
     all_run_dirs = []
     dir_info = []
+    seen_runs = set()
     
     for pdir in parent_dirs:
         if not pdir.is_dir():
             print(f"✗ Not a directory: {pdir}")
             continue
         
-        rdirs = sorted([d for d in pdir.iterdir() if d.is_dir() and d.name.isdigit()])
+        rdirs = [d for d in find_run_dirs(pdir) if d not in seen_runs]
+        seen_runs.update(rdirs)
         if rdirs:
             all_run_dirs.extend(rdirs)
             dir_info.append(f"{pdir.name} ({len(rdirs)} runs)")
