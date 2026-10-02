@@ -4,13 +4,13 @@
 #SBATCH --qos=low
 
 #SBATCH --nodes=1
-#SBATCH --nodelist=sl-mee-br-210        # node request
+#SBATCH --nodelist=sl-mee-br-211        # node request
 #SBATCH --ntasks-per-node=2
 #SBATCH --gres=gpu:h100:2              # 4 GPUs per node for parallel processing
 #SBATCH --mem-per-gpu=160G            # Memory per GPU
 #SBATCH --cpus-per-task=32            # CPUs per task
 
-#SBATCH --job-name=batPar_mergeTest      # Job name for parallel optimization
+#SBATCH --job-name=bp_3fix      # Job name for parallel optimization
 #SBATCH --output=/Odyssey/private/j25lee/.bin/log/%x_%j.log     # Standard output and error log
 # SBATCH --time=12:00:00
 
@@ -67,7 +67,7 @@ export HYDRA_OUTPUT_SUBDIR=null
 
 srun sleep 5
 
-PROJECT_DIR="/Odyssey/private/j25lee/bice/"
+PROJECT_DIR="/Odyssey/private/j25lee/bice/.vibe/worktrees/batch-parallel/"
 cd "$PROJECT_DIR"
 
 # # Create log directory
@@ -135,7 +135,7 @@ echo ""
 # ============================================================================
 
 # Set default config if not provided
-OPT_CONFIG="${OPT_CONFIG:-optimize_ic}"
+OPT_CONFIG="${OPT_CONFIG:-batch_parallel_optim}"
 
 # Set default batch size (number of optimization samples)
 BATCH_SIZE="${BATCH_SIZE:-4}"  # Default: 50 samples
@@ -144,10 +144,10 @@ BATCH_SIZE="${BATCH_SIZE:-4}"  # Default: 50 samples
 START_IDX="${START_IDX:-0}"
 
 # Set default parameters for parallel optimization
-PARAM1="experiment.name=parallel_optim_test_outputFix"
+PARAM1="experiment.name=3fix"
 PARAM2="data.batch_size=$BATCH_SIZE data.sample_idx=$START_IDX"  # Total number of samples, from START_IDX
-PARAM3="optimization.num_iterations=20 \
-        logging.save_frequency=10 \
+PARAM3="optimization.num_iterations=550 \
+        logging.save_frequency=100 \
         loss.weighting=manual"
 
 

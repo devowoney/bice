@@ -416,7 +416,11 @@ def run_optimization_on_batch(
         # Create optimizer for this sample
         # sample_exp_id = f"{exp_id}_sample{sample_idx}_rank{global_rank}"
         sample_exp_id = ""
-        
+
+        # Shared forward model: set this sample's ocean mask so land pixels are
+        # zeroed in normalized space (same as run_optimization.py)
+        forward_model.ocean_mask = ocean_mask_5ch.to(device)
+
         optimizer = ICOptimizer(
             forward_model=forward_model,
             loss_fn=sample_loss_fn,
@@ -438,6 +442,7 @@ def run_optimization_on_batch(
             meta_learner_config=dict(cfg.optimization.meta_learner) if cfg.optimization.get("use_meta_learner", False) else None,
             use_ic_optimizer=cfg.optimization.get("use_ic_optimizer", False),
             ic_optimizer_config=dict(cfg.optimization.ic_optimizer) if cfg.optimization.get("use_ic_optimizer", False) else None,
+            downsampling_method=cfg.optimization.downsampling_method,
         )
 
         # Run optimization
@@ -591,7 +596,8 @@ def main(cfg: DictConfig):
             normalizer_path=cfg.model.location,
             device=device,
             use_gradient_checkpointing=cfg.model.use_gradient_checkpointing,
-            ocean_mask=None,  # Will be set per sample
+            ocean_mask=None,  # Set per sample in run_optimization_on_batch
+            inner_checkpoint_blocks=cfg.model.get("inner_checkpoint_blocks", None),
         )
 
         # Initialize gradient filter
