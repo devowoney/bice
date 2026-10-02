@@ -155,8 +155,11 @@ class MetaLearnerCheckpointManager:
         network_s.load_state_dict(checkpoint_data["network_s_state"])
         
         # Load optimizer state (if available)
-        if "meta_optimizer_state" in checkpoint_data:
+        # (best-loss snapshots are saved with meta_optimizer_state=None)
+        if checkpoint_data.get("meta_optimizer_state") is not None:
             meta_optimizer.load_state_dict(checkpoint_data["meta_optimizer_state"])
+        else:
+            logger.info("No meta-optimizer state in checkpoint; using fresh optimizer state.")
         
         logger.info(f"Loaded meta-learner checkpoint: {checkpoint_path}")
         logger.info(f"  Iteration: {checkpoint_data.get('iteration', 'unknown')}")
