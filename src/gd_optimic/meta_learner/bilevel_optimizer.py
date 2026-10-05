@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.checkpoint import checkpoint
 from omegaconf import DictConfig
 import logging
 import numpy as np
@@ -119,6 +120,7 @@ class BiLevelICOptimizer:
         device: str = "cuda",
         config: Optional[DictConfig] = None,
         writer=None,
+        outer_lr: float = 1.0,
     ):
         """
         Initialize bi-level optimizer for meta-learned IC optimization.
@@ -160,6 +162,7 @@ class BiLevelICOptimizer:
                 - align_lr_multiplier: ALIGN-phase meta learning-rate multiplier (default: 1.0)
                 - trans_lr_multiplier: TRANS-phase meta learning-rate multiplier (default: 1.0)
             writer: TensorBoard SummaryWriter for logging meta-step metrics
+            outer_lr: Outer-loop learning rate η (delta_inner_loss: S predicts steps in units of η·∇J)
         """
         self.network_s = network_s.to(device)
         self.ocean_mask = ocean_mask.to(device).unsqueeze(0)  # [1, H, W]
@@ -194,6 +197,29 @@ class BiLevelICOptimizer:
         # Override: If meta_one_task is False, force hybrid_input to False
         if not self.meta_one_task:
             self.hybrid_input = False
+
+        # Δ inner loss (child of hybrid_input)
+        # ------------------------------------
+        # In plain words: the network S learns to propose an IC step that looks like a
+        # gradient-descent step (learning_rate × gradient), and we apply it K times per
+        # outer iteration instead of calling the expensive forward model K times.
+        #
+        # S is trained with two signals, neither of which runs GloNet inside the meta loop:
+        #   - l_align: "look like a GD step" (compare S's step with learning_rate × gradient).
+        #   - l_perf:  "did the last move actually reduce the cost?" It reuses the gradient
+        #              the outer loop computes at the new IC anyway, and backpropagates it
+        #              through S only: dJ(ψ^k)/dθ = −∇J(ψ^k)ᵀ ∂(ψ^{k-1} − ψ^k)/∂θ.
+        # Each meta-step minimizes w_align·l_align + l_reg; only the first one adds
+        # w_perf_delta·l_perf, because only then is its gradient exact.
+        self.delta_inner_loss = config.get("delta_inner_loss", False)
+        if self.delta_inner_loss and not (self.meta_one_task and self.hybrid_input):
+            raise ValueError("delta_inner_loss=True requires meta_one_task=True and hybrid_input=True")
+        self.delta_inner_k = int(config.get("delta_inner_k", 20))  # how many times S is applied per outer iteration
+        self.w_perf_delta = float(config.get("w_perf_delta", 2.5))  # weight of l_perf in the meta loss
+        self.outer_lr = float(outer_lr)  # η: the reference GD step is η × gradient
+        # Everything needed to replay the previous outer iteration's K-step move next time:
+        # (IC before the move, gradient used, its mean, its std, iteration index, squared gradient norm)
+        self._chain_prev = None
         
         # Curriculum: three-phase learning (only used when meta_general_training=True)
         self.grad_align_steps = config.get("grad_align_steps", 6)  # Number of initial meta-steps to focus on alignment
@@ -295,6 +321,11 @@ class BiLevelICOptimizer:
                 - L_reg: L2 regularization penalty
                 - cosine_similarity: Cosine similarity between meta_output and outer_loop_gradient
         """
+
+        # Δ inner-loss mode has its own loop (no ALIGN/TRANS/PERF phases, no forward
+        # model inside the meta-steps); everything below is the original meta loop.
+        if self.delta_inner_loss:
+            return self._delta_inner_step(x_current, gradient_prev, iteration)
 
         gradient_prev = gradient_prev.to(self.device).detach()
         gradient_mean, gradient_std = self._get_gradient_statistics(gradient_prev)
@@ -716,13 +747,20 @@ class BiLevelICOptimizer:
             iteration: Outer-loop iteration k
 
         Returns:
-            ic_update: [B, T, C, H, W] update in gradient space (x_new = x - ic_update)
+            ic_update: [B, T, C, H, W] update in gradient space (x_new = x - ic_update);
+                with delta_inner_loss, the physical step Δ̂ ≈ η·∇J
             ic_update_standardized: [B, T, C, H, W] raw network output s (standardized, bounded by output_scale)
             gradient_standardized: [B, T, C, H, W] standardized gradient
         """
-        gradient_standardized = (
-            gradient - self._broadcast_channels(gradient_mean, gradient)
-        ) / self._broadcast_channels(gradient_std, gradient)
+        if self.delta_inner_loss:
+            # Divide by the per-channel std only, without subtracting the mean, so a zero
+            # gradient stays zero (land and flat regions get no update). This is also the
+            # target of l_align: η·∇ expressed in units of η·σ_∇ is simply ∇/σ_∇.
+            gradient_standardized = gradient / self._broadcast_channels(gradient_std, gradient)
+        else:
+            gradient_standardized = (
+                gradient - self._broadcast_channels(gradient_mean, gradient)
+            ) / self._broadcast_channels(gradient_std, gradient)
 
         if self.hybrid_input:
             # Standardize IC by IC statistics, gradient by gradient statistics
@@ -734,11 +772,229 @@ class BiLevelICOptimizer:
 
         ic_update_standardized = self.predict_update(x_in, iteration=iteration)
 
+        if self.delta_inner_loss:
+            # Turn the network output back into a physical IC step:
+            #   s / output_scale  -> step in "gradient std" units (≈ ∇/σ_∇ if S imitates GD)
+            #   × η · σ_∇         -> step in IC units, comparable to one GD step η·∇J
+            ic_update = (
+                ic_update_standardized / self.network_s.output_scale
+                * self.outer_lr * self._broadcast_channels(gradient_std, gradient)
+            )
+            return ic_update, ic_update_standardized, gradient_standardized
+
         # Destandardize using gradient statistics
         ic_update = (
             ic_update_standardized * self._broadcast_channels(gradient_std, gradient)
         ) + self._broadcast_channels(gradient_mean, gradient)
         return ic_update, ic_update_standardized, gradient_standardized
+
+    def delta_chain(
+        self,
+        x: torch.Tensor,
+        gradient: torch.Tensor,
+        gradient_mean: torch.Tensor,
+        gradient_std: torch.Tensor,
+        iteration: int,
+    ) -> torch.Tensor:
+        """
+        Move the IC K times with the network S, keeping the outer gradient fixed:
+        ψ_{m+1} = ψ_m − Δ̂_θ(ψ_m, ∇J(ψ^k), k). Returns the final IC ψ_K.
+
+        This replaces the "K inner steps" of the original meta loop: the gradient is
+        computed once by the outer loop, and S proposes K successive moves from it.
+        Only S is evaluated here, never the forward model.
+
+        Memory: when gradients are tracked (to train S through the whole chain), each
+        application is checkpointed. Only the K intermediate ICs are kept and S's
+        activations are recomputed during backward (~0.07 GiB per step instead of ~5 GiB).
+        """
+        use_ckpt = torch.is_grad_enabled()  # no checkpointing needed when just applying S
+        for _ in range(self.delta_inner_k):
+            if use_ckpt:
+                ic_update = checkpoint(
+                    self._chain_update, x, gradient, gradient_mean, gradient_std, iteration,
+                    use_reentrant=False,
+                )
+            else:
+                ic_update = self._chain_update(x, gradient, gradient_mean, gradient_std, iteration)
+            x = x - ic_update
+        return x
+
+    def _chain_update(self, x, gradient, gradient_mean, gradient_std, iteration):
+        # One application of S, returning only the IC step (wrapper for checkpoint())
+        return self.one_task_update(x, gradient, gradient_mean, gradient_std, iteration)[0]
+
+    def _delta_inner_step(
+        self,
+        x_current: torch.Tensor,
+        gradient: torch.Tensor,
+        iteration: int,
+    ) -> Dict[str, float]:
+        """
+        One outer iteration of the Δ inner-loss mode.
+
+        In plain words:
+          1. Train S for num_meta_steps steps. Every step asks S to look like a GD step
+             (l_align); the first step also tells S whether its previous K-step move
+             really reduced the cost (l_perf).
+          2. Move the IC with K applications of the trained S.
+          3. Run the forward model once (no gradient) to report the new cost.
+          4. Remember this move so it can be judged next iteration, when the outer
+             loop has computed the gradient at the new IC.
+
+        num_meta_steps meta-steps of
+            w_align·l_align + l_reg            (+ w_perf_delta·l_perf on the first step)
+        where
+            l_align = masked MSE between one application of S and η·∇J(ψ^k), in units of η·σ_∇
+            l_perf  = −⟨∇J(ψ^k), ψ^{k-1} − ψ_K(θ)⟩ / (K·η·||∇J(ψ^{k-1})||²)
+        ψ_K(θ) rebuilds the previous K-step chain from ψ^{k-1}. On the first meta-step θ is
+        still the one that produced ψ^k, so the θ-gradient of l_perf is exactly dJ(ψ^k)/dθ.
+        l_perf ≈ −1 when the chain matches K plain GD steps and ∇J did not change.
+        l_perf is absent at the first outer iteration (no previous chain).
+
+        Then ψ^{k+1} = delta_chain(ψ^k) (no grad) and one forward pass for the loss.
+        No forward model call happens inside the meta-steps.
+        """
+        gradient = gradient.to(self.device).detach()
+        gradient_mean, gradient_std = self._get_gradient_statistics(gradient)
+        self.network_s.train()
+
+        x_det = x_current.detach()  # current IC ψ^k (fixed data for S's training)
+        params = list(self.network_s.parameters())
+        n_params = sum(p.numel() for p in params)
+        prev = self._chain_prev  # previous iteration's move, None at the first iteration
+
+        last_l_align = last_l_perf = last_l_reg = last_cosine_sim = grad_norm = 0.0
+        last_rho = None
+        for m in range(self.num_meta_steps):
+            self.meta_optimizer.zero_grad()
+
+            # --- l_align: "look like a GD step" ---
+            # Apply S once at the current IC and compare its step with η·∇J(ψ^k).
+            # Both sides are in gradient-std units, and only ocean points count.
+            ic_update, ic_update_standardized, gradient_standardized = self.one_task_update(
+                x_det, gradient, gradient_mean, gradient_std, iteration
+            )
+            align_mask = self._ocean_mask_like(ic_update_standardized).expand_as(ic_update_standardized)
+            predicted_standardized = ic_update_standardized / self.network_s.output_scale
+            l_align = (
+                (gradient_standardized - predicted_standardized).pow(2) * align_mask
+            ).sum() / align_mask.sum().clamp_min(1.0)
+            l_reg = self.lambda_reg * (self.lambda_reg * sum((p ** 2).sum() for p in params) / n_params)
+            l_meta = self.w_align * l_align + l_reg
+
+            last_cosine_sim = torch.nn.functional.cosine_similarity(
+                ic_update.detach().flatten(start_dim=2), gradient.flatten(start_dim=2), dim=-1
+            ).mean().item()
+
+            # --- l_perf: "did the previous move reduce the cost?" (first meta-step only) ---
+            l_perf = None
+            if m == 0 and prev is not None:
+                x_prev, g_prev, mean_prev, std_prev, it_prev, gnorm2_prev = prev
+                # Replay last iteration's K-step move from the same starting IC, this time
+                # tracking gradients through S. θ has not changed since that move was made,
+                # so this rebuilds exactly the move that produced the current IC ψ^k.
+                total_step = x_prev - self.delta_chain(x_prev, g_prev, mean_prev, std_prev, it_prev)
+                # Inner product of the gradient at the new IC with the move. Its θ-gradient is
+                # exactly dJ(ψ^k)/dθ, so minimizing it makes S's moves reduce the cost.
+                # (The value itself is only a first-order estimate of the cost decrease.)
+                # Dividing by K·η·||∇J(ψ^{k-1})||², the predicted decrease of K plain GD steps,
+                # makes it unitless: about −1 if the move equals K GD steps and the gradient
+                # did not change, closer to 0 when the move overshoots.
+                l_perf = -(gradient * total_step).sum() / (
+                    self.delta_inner_k * self.outer_lr * gnorm2_prev
+                )
+                last_l_perf = float(l_perf.detach().cpu().item())
+                with torch.no_grad():
+                    # Diagnostic: did the move go too far?
+                    # ρ = ⟨∇J(ψ^k), step⟩ / ⟨∇J(ψ^{k-1}), step⟩
+                    #   ~1: gradient barely changed -> the move was too short
+                    #   ~0: the move used up the descent direction -> well sized
+                    #   <0: the gradient flipped -> the move overshot
+                    denom = (g_prev * total_step).sum()
+                    last_rho = float(((gradient * total_step).sum() / denom).cpu().item()) if denom != 0 else None
+                del total_step
+
+                # Diagnostic: how strongly each term pulls on S's weights, to help choose
+                # w_perf_delta (the values of l_align and l_perf are not comparable on their own)
+                if self.writer is not None:
+                    g_align = torch.autograd.grad(self.w_align * l_align, params, retain_graph=True, allow_unused=True)
+                    g_perf = torch.autograd.grad(self.w_perf_delta * l_perf, params, retain_graph=True, allow_unused=True)
+                    norm = lambda gs: sum(g.pow(2).sum() for g in gs if g is not None).sqrt().item()
+                    self.writer.add_scalar("meta/grad_norm_align", norm(g_align), iteration + 1)
+                    self.writer.add_scalar("meta/grad_norm_perf", norm(g_perf), iteration + 1)
+                    del g_align, g_perf
+
+                l_meta = l_meta + self.w_perf_delta * l_perf
+
+            l_meta.backward()
+            torch.nn.utils.clip_grad_norm_(params, max_norm=self.grad_clip_norm)
+            grad_norm = sum(p.grad.norm().item() ** 2 for p in params if p.grad is not None) ** 0.5
+            self.meta_optimizer.step()
+
+            last_l_align = float((self.w_align * l_align).detach().cpu().item())
+            last_l_reg = float(l_reg.detach().cpu().item())
+
+            if self.writer is not None:
+                global_step = iteration * self.num_meta_steps + m + 1
+                self.writer.add_scalar("meta_steps/L_align", last_l_align, global_step)
+                self.writer.add_scalar("meta_steps/L_reg", last_l_reg, global_step)
+                self.writer.add_scalar("meta_steps/grad_norm", grad_norm, global_step)
+                self.writer.add_scalar("meta_steps/cosine_similarity", last_cosine_sim, global_step)
+
+            del ic_update, ic_update_standardized, gradient_standardized, l_align, l_reg, l_meta, l_perf
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # --- Move the IC: K applications of the trained S, then report the new cost ---
+        with torch.no_grad():
+            final_x = self.delta_chain(x_det, gradient, gradient_mean, gradient_std, iteration).detach()
+            step_total = x_det - final_x
+            # Diagnostics: size of the move relative to K plain GD steps (1 = same size),
+            # and its direction relative to the gradient (1 = same direction)
+            step_ratio = float(
+                (step_total.norm() / (self.delta_inner_k * self.outer_lr * gradient.norm()).clamp_min(1e-30)).cpu().item()
+            )
+            step_cosine = torch.nn.functional.cosine_similarity(
+                step_total.flatten(), gradient.flatten(), dim=0
+            ).item()
+            # The only forward-model call of this iteration (no backward): cost at the new IC
+            _, final_y_hat_steps = self.forward_model.forward(final_x, self.num_forecast_steps)
+            loss_final, _ = self.loss_fn(final_y_hat_steps, self.target_sequence, return_details=True)
+            final_loss = float(loss_final.mean().cpu().item())
+            final_y_hat_steps = final_y_hat_steps.detach()
+            del step_total, loss_final
+
+        # Remember this move. Next iteration the outer loop computes the gradient at the new
+        # IC; l_perf then replays this move and uses that gradient to judge it.
+        self._chain_prev = (
+            x_det, gradient, gradient_mean, gradient_std, iteration,
+            gradient.pow(2).sum().clamp_min(torch.finfo(gradient.dtype).tiny),
+        )
+
+        if self.writer is not None:
+            self.writer.add_scalar("meta/L_perf", last_l_perf, iteration + 1)
+            self.writer.add_scalar("meta/step_ratio_vs_K_gd", step_ratio, iteration + 1)
+            self.writer.add_scalar("meta/step_cosine", step_cosine, iteration + 1)
+            if last_rho is not None:
+                self.writer.add_scalar("meta/rho", last_rho, iteration + 1)
+
+        logger.info(
+            f"Δ inner loss (K={self.delta_inner_k}): L_align={last_l_align:.6f}, "
+            f"L_perf={last_l_perf:.6f}, L_reg={last_l_reg:.3e}, cos(S,∇)={last_cosine_sim:.4f}, "
+            f"|step|/(Kη|∇|)={step_ratio:.3f}, cos(step,∇)={step_cosine:.4f}, rho={last_rho}"
+        )
+
+        return {
+            "L_align": last_l_align,
+            "L_perf": last_l_perf,
+            "L_reg": last_l_reg,
+            "cosine_similarity": last_cosine_sim,
+            "num_meta_steps": self.num_meta_steps,
+            "_final_x": final_x,
+            "_final_loss": final_loss,
+            "_final_y_hat_steps": final_y_hat_steps,
+        }
 
     def _ocean_mask_like(self, value: torch.Tensor) -> torch.Tensor:
         """Broadcast self.ocean_mask ([C, H, W] or [1, C, H, W]) over a 4D or 5D field."""

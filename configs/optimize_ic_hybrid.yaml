@@ -117,6 +117,13 @@ optimization:
     meta_one_task: true
     meta_general_training: false
     hybrid_input: true   # NEW: Hybrid mode - combine IC + gradient + iteration
+    delta_inner_loss: false  # Child flag of hybrid_input: S predicts a step Δ ≈ learning_rate·∇ and is applied
+                             # delta_inner_k times per outer gradient. Each meta-step: w_align·l_align + l_reg;
+                             # the first one also adds w_perf_delta·l_perf (variational cost of the previous outer
+                             # step, backprop through S only, no GloNet). Ignored in this mode: grad_align_steps,
+                             # grad_trans_steps, w_trans, w_perf, *_lr_multiplier.
+    delta_inner_k: 20        # Chain length K (memory ~6.3 GiB + ~0.07 GiB per step, gradient checkpointing)
+    w_perf_delta: 2.5        # l_perf weight (l_perf ~ -0.2 vs l_align ~ 0.5); check meta/grad_norm_{align,perf}
     mode: "training"  # Options:
                        # - 'training': Train meta-learner from scratch
                        # - 'fine_tune': Load pre-trained and fine-tune

@@ -356,6 +356,7 @@ class ICOptimizer:
                 device=self.device,
                 config=self.meta_learner_config,
                 writer=self.writer,
+                outer_lr=self.learning_rate,
             )
             logger.info("  BiLevelICOptimizer initialized successfully\n")
 
@@ -577,11 +578,18 @@ class ICOptimizer:
                     x_outer_before = x0_current.detach()
                     x_inner = x_outer_before
                     gradient_mean, gradient_std = self.meta_learner._get_gradient_statistics(masked_gradients)
-                    for _ in range(self.meta_learner.num_meta_steps):
-                        ic_update, _, _ = self.meta_learner.one_task_update(
+                    if self.meta_learner.delta_inner_loss:
+                        # Same move as in training: apply the frozen S delta_inner_k times
+                        # from the current IC, with this iteration's gradient held fixed
+                        x_inner = self.meta_learner.delta_chain(
                             x_inner, masked_gradients, gradient_mean, gradient_std, iteration
                         )
-                        x_inner = x_inner - ic_update
+                    else:
+                        for _ in range(self.meta_learner.num_meta_steps):
+                            ic_update, _, _ = self.meta_learner.one_task_update(
+                                x_inner, masked_gradients, gradient_mean, gradient_std, iteration
+                            )
+                            x_inner = x_inner - ic_update
                     _, y_hat_steps = self.forward_model.forward(x_inner, num_forecast_steps)
                     loss, loss_details = self.loss_fn(y_hat_steps, target_sequence, return_details=True)
                     self._last_ic_update = (x_outer_before - x_inner).cpu().clone()
