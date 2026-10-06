@@ -205,7 +205,7 @@ class BiLevelICOptimizer:
         # outer iteration instead of calling the expensive forward model K times.
         #
         # S is trained with two signals, neither of which runs GloNet inside the meta loop:
-        #   - l_align: "look like a GD step" (compare S's step with learning_rate × gradient).
+        #   - l_align: "point in the gradient's direction" (1 − cosine; says nothing about length).
         #   - l_perf:  "did the last move actually reduce the cost?" It reuses the gradient
         #              the outer loop computes at the new IC anyway, and backpropagates it
         #              through S only: dJ(ψ^k)/dθ = −∇J(ψ^k)ᵀ ∂(ψ^{k-1} − ψ^k)/∂θ.
@@ -217,6 +217,12 @@ class BiLevelICOptimizer:
         self.delta_inner_k = int(config.get("delta_inner_k", 20))  # how many times S is applied per outer iteration
         self.w_perf_delta = float(config.get("w_perf_delta", 2.5))  # weight of l_perf in the meta loss
         self.outer_lr = float(outer_lr)  # η: the reference GD step is η × gradient
+        if self.delta_inner_loss and self.network_s.output_scale < 1.0:
+            # In this mode output_scale caps S's step per pixel at output_scale·η·σ_∇
+            logger.warning(
+                f"delta_inner_loss with output_scale={self.network_s.output_scale}: S cannot take "
+                f"even one plain-GD-sized step per pixel. Set output_scale ≈ 5."
+            )
         # Everything needed to replay the previous outer iteration's K-step move next time:
         # (IC before the move, gradient used, its mean, its std, iteration index, squared gradient norm)
         self._chain_prev = None
@@ -240,7 +246,10 @@ class BiLevelICOptimizer:
         self.meta_optimizer = optim.Adam(
             self.network_s.parameters(),
             lr=self.meta_lr,
-            weight_decay=1e-2,
+            # Δ inner loss: no weight decay. Its l_align is direction-only, so nothing would
+            # counteract the shrinkage of S's weights, and S's steps would keep getting smaller
+            # even when l_perf asks for bigger ones (l_reg still regularizes the weights).
+            weight_decay=0.0 if self.delta_inner_loss else 1e-2,
         )
         self._meta_base_lrs = [group["lr"] for group in self.meta_optimizer.param_groups]
 
@@ -754,8 +763,8 @@ class BiLevelICOptimizer:
         """
         if self.delta_inner_loss:
             # Divide by the per-channel std only, without subtracting the mean, so a zero
-            # gradient stays zero (land and flat regions get no update). This is also the
-            # target of l_align: η·∇ expressed in units of η·σ_∇ is simply ∇/σ_∇.
+            # gradient stays zero (land and flat regions get no update). l_align compares
+            # the direction of S's output with this field.
             gradient_standardized = gradient / self._broadcast_channels(gradient_std, gradient)
         else:
             gradient_standardized = (
@@ -774,10 +783,13 @@ class BiLevelICOptimizer:
 
         if self.delta_inner_loss:
             # Turn the network output back into a physical IC step:
-            #   s / output_scale  -> step in "gradient std" units (≈ ∇/σ_∇ if S imitates GD)
-            #   × η · σ_∇         -> step in IC units, comparable to one GD step η·∇J
+            #   s          -> step in "gradient std" units (≈ ∇/σ_∇ if S imitates GD),
+            #                 bounded per pixel by ±output_scale through the final tanh
+            #   × η · σ_∇  -> step in IC units, comparable to one GD step η·∇J
+            # So output_scale is a safety cap measured in gradient std: with output_scale ≈ 5
+            # S can take steps up to 5× a GD step per pixel, but not explode.
             ic_update = (
-                ic_update_standardized / self.network_s.output_scale
+                ic_update_standardized
                 * self.outer_lr * self._broadcast_channels(gradient_std, gradient)
             )
             return ic_update, ic_update_standardized, gradient_standardized
@@ -834,9 +846,9 @@ class BiLevelICOptimizer:
         One outer iteration of the Δ inner-loss mode.
 
         In plain words:
-          1. Train S for num_meta_steps steps. Every step asks S to look like a GD step
-             (l_align); the first step also tells S whether its previous K-step move
-             really reduced the cost (l_perf).
+          1. Train S for num_meta_steps steps. Every step asks S to point in the gradient's
+             direction (l_align); the first step also tells S whether its previous K-step
+             move really reduced the cost (l_perf), which is what sets the step size.
           2. Move the IC with K applications of the trained S.
           3. Run the forward model once (no gradient) to report the new cost.
           4. Remember this move so it can be judged next iteration, when the outer
@@ -845,7 +857,7 @@ class BiLevelICOptimizer:
         num_meta_steps meta-steps of
             w_align·l_align + l_reg            (+ w_perf_delta·l_perf on the first step)
         where
-            l_align = masked MSE between one application of S and η·∇J(ψ^k), in units of η·σ_∇
+            l_align = 1 − cos(one application of S, ∇J(ψ^k)) over ocean points (direction only)
             l_perf  = −⟨∇J(ψ^k), ψ^{k-1} − ψ_K(θ)⟩ / (K·η·||∇J(ψ^{k-1})||²)
         ψ_K(θ) rebuilds the previous K-step chain from ψ^{k-1}. On the first meta-step θ is
         still the one that produced ψ^k, so the θ-gradient of l_perf is exactly dJ(ψ^k)/dθ.
@@ -869,17 +881,21 @@ class BiLevelICOptimizer:
         for m in range(self.num_meta_steps):
             self.meta_optimizer.zero_grad()
 
-            # --- l_align: "look like a GD step" ---
-            # Apply S once at the current IC and compare its step with η·∇J(ψ^k).
-            # Both sides are in gradient-std units, and only ocean points count.
+            # --- l_align: "point in the same direction as the gradient" ---
+            # Apply S once at the current IC and compare the DIRECTION of its step with the
+            # gradient: l_align = 1 − cos(S's step, ∇J(ψ^k)), over ocean points, in gradient-std
+            # units (0 = same direction, 1 = orthogonal). It does not care about the step's
+            # length: the step size is left to l_perf, so S is not pulled back to the size of
+            # one GD step (output_scale still caps each pixel at output_scale·η·σ_∇).
             ic_update, ic_update_standardized, gradient_standardized = self.one_task_update(
                 x_det, gradient, gradient_mean, gradient_std, iteration
             )
             align_mask = self._ocean_mask_like(ic_update_standardized).expand_as(ic_update_standardized)
-            predicted_standardized = ic_update_standardized / self.network_s.output_scale
-            l_align = (
-                (gradient_standardized - predicted_standardized).pow(2) * align_mask
-            ).sum() / align_mask.sum().clamp_min(1.0)
+            l_align = 1.0 - torch.nn.functional.cosine_similarity(
+                (ic_update_standardized * align_mask).flatten(start_dim=1),
+                (gradient_standardized * align_mask).flatten(start_dim=1),
+                dim=-1,
+            ).mean()
             l_reg = self.lambda_reg * (self.lambda_reg * sum((p ** 2).sum() for p in params) / n_params)
             l_meta = self.w_align * l_align + l_reg
 

@@ -122,8 +122,11 @@ optimization:
                              # the first one also adds w_perf_delta·l_perf (variational cost of the previous outer
                              # step, backprop through S only, no GloNet). Ignored in this mode: grad_align_steps,
                              # grad_trans_steps, w_trans, w_perf, *_lr_multiplier.
+                             # Set output_scale ≈ 5 in this mode: it caps S's step per pixel at
+                             # output_scale·learning_rate·σ_∇ (0.1 would allow only 1/10 of a GD step).
     delta_inner_k: 20        # Chain length K (memory ~6.3 GiB + ~0.07 GiB per step, gradient checkpointing)
-    w_perf_delta: 2.5        # l_perf weight (l_perf ~ -0.2 vs l_align ~ 0.5); check meta/grad_norm_{align,perf}
+    w_perf_delta: 2.5        # l_perf weight. l_align is direction-only (1 - cos), so l_perf alone sets the step
+                             # size; check meta/grad_norm_{align,perf}, meta/rho and meta/step_ratio_vs_K_gd
     mode: "training"  # Options:
                        # - 'training': Train meta-learner from scratch
                        # - 'fine_tune': Load pre-trained and fine-tune
