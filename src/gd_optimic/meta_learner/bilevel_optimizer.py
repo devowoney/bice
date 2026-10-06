@@ -209,8 +209,9 @@ class BiLevelICOptimizer:
         #   - l_perf:  "did the last move actually reduce the cost?" It reuses the gradient
         #              the outer loop computes at the new IC anyway, and backpropagates it
         #              through S only: dJ(ψ^k)/dθ = −∇J(ψ^k)ᵀ ∂(ψ^{k-1} − ψ^k)/∂θ.
-        # Each meta-step minimizes w_align·l_align + l_reg; only the first one adds
-        # w_perf_delta·l_perf, because only then is its gradient exact.
+        # The meta-steps follow the original ALIGN -> TRANS -> PERF phases
+        # (grad_align_steps, grad_trans_steps): ALIGN uses l_align + l_reg, TRANS uses all
+        # three terms, PERF uses w_perf_delta·l_perf + l_reg, which sets the step size.
         self.delta_inner_loss = config.get("delta_inner_loss", False)
         if self.delta_inner_loss and not (self.meta_one_task and self.hybrid_input):
             raise ValueError("delta_inner_loss=True requires meta_one_task=True and hybrid_input=True")
@@ -240,6 +241,13 @@ class BiLevelICOptimizer:
         # Meta-optimizer
         self.meta_lr = config.get("meta_lr", 1e-3)
         self.num_meta_steps = config.get("num_meta_steps", 10)  # ← NEW: multiple meta updates per IC update
+        if self.delta_inner_loss and self.grad_align_steps >= self.num_meta_steps:
+            # In Δ inner-loss mode the first grad_align_steps meta-steps are l_align only;
+            # l_perf joins after them, so it would never be used here.
+            logger.warning(
+                f"delta_inner_loss with grad_align_steps={self.grad_align_steps} >= "
+                f"num_meta_steps={self.num_meta_steps}: l_perf is never used."
+            )
         self.align_lr_multiplier = float(config.get("align_lr_multiplier", 1.0))
         self.trans_lr_multiplier = float(config.get("trans_lr_multiplier", 1.0))
         self.perf_lr_multiplier = float(config.get("perf_lr_multiplier", 1.0))
@@ -846,21 +854,27 @@ class BiLevelICOptimizer:
         One outer iteration of the Δ inner-loss mode.
 
         In plain words:
-          1. Train S for num_meta_steps steps. Every step asks S to point in the gradient's
-             direction (l_align); the first step also tells S whether its previous K-step
-             move really reduced the cost (l_perf), which is what sets the step size.
+          1. Train S for num_meta_steps steps, in three phases (as in the original loop):
+             - ALIGN (first grad_align_steps steps): only ask S to point in the gradient's
+               direction (l_align);
+             - TRANS (next grad_trans_steps steps): both l_align and l_perf;
+             - PERF (remaining steps): only ask whether S's previous K-step move really
+               reduced the cost (l_perf, weighted by w_perf_delta). This sets the step size.
           2. Move the IC with K applications of the trained S.
           3. Run the forward model once (no gradient) to report the new cost.
           4. Remember this move so it can be judged next iteration, when the outer
              loop has computed the gradient at the new IC.
 
         num_meta_steps meta-steps of
-            w_align·l_align + l_reg            (+ w_perf_delta·l_perf on the first step)
+            w_align·l_align + l_reg                          (ALIGN)
+            w_align·l_align + w_perf_delta·l_perf + l_reg    (TRANS)
+            w_perf_delta·l_perf + l_reg                      (PERF)
         where
             l_align = 1 − cos(one application of S, ∇J(ψ^k)) over ocean points (direction only)
             l_perf  = −⟨∇J(ψ^k), ψ^{k-1} − ψ_K(θ)⟩ / (K·η·||∇J(ψ^{k-1})||²)
-        ψ_K(θ) rebuilds the previous K-step chain from ψ^{k-1}. On the first meta-step θ is
-        still the one that produced ψ^k, so the θ-gradient of l_perf is exactly dJ(ψ^k)/dθ.
+        ψ_K(θ) replays the previous K-step chain from ψ^{k-1} with the current θ. The value is
+        a first-order model of the cost after that move; its θ-gradient is exactly dJ(ψ^k)/dθ
+        only while θ is unchanged (grad_align_steps = 0), otherwise a close approximation.
         l_perf ≈ −1 when the chain matches K plain GD steps and ∇J did not change.
         l_perf is absent at the first outer iteration (no previous chain).
 
@@ -878,8 +892,36 @@ class BiLevelICOptimizer:
 
         last_l_align = last_l_perf = last_l_reg = last_cosine_sim = grad_norm = 0.0
         last_rho = None
+        if prev is not None:
+            # Diagnostics on the move that was actually applied last iteration (independent of
+            # how θ changes below, so they stay exact):
+            #   ρ = ⟨∇J(ψ^k), step⟩ / ⟨∇J(ψ^{k-1}), step⟩
+            #     ~1: gradient barely changed -> the move was too short
+            #     ~0: the move used up the descent direction -> well sized
+            #     <0: the gradient flipped -> the move overshot
+            #   L_perf (logged) = −⟨∇J(ψ^k), step⟩ / (K·η·||∇J(ψ^{k-1})||²) = −ρ · ratio · cos
+            _, g_prev, _, _, _, gnorm2_prev, step_prev = prev
+            with torch.no_grad():
+                denom = (g_prev * step_prev).sum()
+                last_rho = float(((gradient * step_prev).sum() / denom).cpu().item()) if denom != 0 else None
+                last_l_perf = float((
+                    -(gradient * step_prev).sum() / (self.delta_inner_k * self.outer_lr * gnorm2_prev)
+                ).cpu().item())
+
         for m in range(self.num_meta_steps):
             self.meta_optimizer.zero_grad()
+
+            # Phase of this meta-step (same keys as the original meta loop):
+            #   ALIGN: l_align + l_reg               (introduction: learn the direction)
+            #   TRANS: l_align + l_perf + l_reg      (hand-over between the two)
+            #   PERF:  l_perf + l_reg                (step size and usefulness of the move)
+            # The first outer iteration has no previous move to judge, so it is ALIGN only.
+            if prev is None or m < self.grad_align_steps:
+                phase_name = "ALIGN"
+            elif m < self.grad_align_steps + self.grad_trans_steps:
+                phase_name = "TRANS"
+            else:
+                phase_name = "PERF"
 
             # --- l_align: "point in the same direction as the gradient" ---
             # Apply S once at the current IC and compare the DIRECTION of its step with the
@@ -897,43 +939,44 @@ class BiLevelICOptimizer:
                 dim=-1,
             ).mean()
             l_reg = self.lambda_reg * (self.lambda_reg * sum((p ** 2).sum() for p in params) / n_params)
-            l_meta = self.w_align * l_align + l_reg
+            l_meta = l_reg
+            if phase_name in ("ALIGN", "TRANS"):
+                l_meta = l_meta + self.w_align * l_align
+            # (In PERF, l_align is still computed, but only logged.)
 
             last_cosine_sim = torch.nn.functional.cosine_similarity(
                 ic_update.detach().flatten(start_dim=2), gradient.flatten(start_dim=2), dim=-1
             ).mean().item()
 
-            # --- l_perf: "did the previous move reduce the cost?" (first meta-step only) ---
+            # --- l_perf: "did the previous move reduce the cost?" (TRANS and PERF) ---
             l_perf = None
-            if m == 0 and prev is not None:
-                x_prev, g_prev, mean_prev, std_prev, it_prev, gnorm2_prev = prev
-                # Replay last iteration's K-step move from the same starting IC, this time
-                # tracking gradients through S. θ has not changed since that move was made,
-                # so this rebuilds exactly the move that produced the current IC ψ^k.
+            if phase_name in ("TRANS", "PERF"):
+                x_prev, g_prev, mean_prev, std_prev, it_prev, gnorm2_prev, _ = prev
+                # Replay last iteration's K-step move from the same starting IC with the
+                # current θ, tracking gradients through S. (If θ has not changed yet this
+                # iteration, this rebuilds exactly the move that produced ψ^k.)
                 total_step = x_prev - self.delta_chain(x_prev, g_prev, mean_prev, std_prev, it_prev)
-                # Inner product of the gradient at the new IC with the move. Its θ-gradient is
-                # exactly dJ(ψ^k)/dθ, so minimizing it makes S's moves reduce the cost.
-                # (The value itself is only a first-order estimate of the cost decrease.)
+                # Inner product of the gradient at the new IC with the move: a first-order
+                # model of the cost after the move. Minimizing it makes S's moves reduce the
+                # cost; its θ-gradient is exactly dJ(ψ^k)/dθ while θ is unchanged, and a close
+                # approximation after the introduction steps have moved θ a little.
                 # Dividing by K·η·||∇J(ψ^{k-1})||², the predicted decrease of K plain GD steps,
                 # makes it unitless: about −1 if the move equals K GD steps and the gradient
                 # did not change, closer to 0 when the move overshoots.
                 l_perf = -(gradient * total_step).sum() / (
                     self.delta_inner_k * self.outer_lr * gnorm2_prev
                 )
-                last_l_perf = float(l_perf.detach().cpu().item())
-                with torch.no_grad():
-                    # Diagnostic: did the move go too far?
-                    # ρ = ⟨∇J(ψ^k), step⟩ / ⟨∇J(ψ^{k-1}), step⟩
-                    #   ~1: gradient barely changed -> the move was too short
-                    #   ~0: the move used up the descent direction -> well sized
-                    #   <0: the gradient flipped -> the move overshot
-                    denom = (g_prev * total_step).sum()
-                    last_rho = float(((gradient * total_step).sum() / denom).cpu().item()) if denom != 0 else None
                 del total_step
-
-                # Diagnostic: how strongly each term pulls on S's weights, to help choose
-                # w_perf_delta (the values of l_align and l_perf are not comparable on their own)
                 if self.writer is not None:
+                    self.writer.add_scalar(
+                        "meta_steps/L_perf", float(l_perf.detach().cpu().item()),
+                        iteration * self.num_meta_steps + m + 1,
+                    )
+
+                # Diagnostic (first step using l_perf only): how strongly each term pulls on S's
+                # weights, to help choose w_perf_delta (the values of l_align and l_perf are
+                # not comparable on their own)
+                if m == self.grad_align_steps and self.writer is not None:
                     g_align = torch.autograd.grad(self.w_align * l_align, params, retain_graph=True, allow_unused=True)
                     g_perf = torch.autograd.grad(self.w_perf_delta * l_perf, params, retain_graph=True, allow_unused=True)
                     norm = lambda gs: sum(g.pow(2).sum() for g in gs if g is not None).sqrt().item()
@@ -957,6 +1000,7 @@ class BiLevelICOptimizer:
                 self.writer.add_scalar("meta_steps/L_reg", last_l_reg, global_step)
                 self.writer.add_scalar("meta_steps/grad_norm", grad_norm, global_step)
                 self.writer.add_scalar("meta_steps/cosine_similarity", last_cosine_sim, global_step)
+                self.writer.add_scalar("meta_steps/phase", {"ALIGN": 0, "TRANS": 1, "PERF": 2}[phase_name], global_step)
 
             del ic_update, ic_update_standardized, gradient_standardized, l_align, l_reg, l_meta, l_perf
             if torch.cuda.is_available():
@@ -979,13 +1023,15 @@ class BiLevelICOptimizer:
             loss_final, _ = self.loss_fn(final_y_hat_steps, self.target_sequence, return_details=True)
             final_loss = float(loss_final.mean().cpu().item())
             final_y_hat_steps = final_y_hat_steps.detach()
-            del step_total, loss_final
+            del loss_final
 
         # Remember this move. Next iteration the outer loop computes the gradient at the new
-        # IC; l_perf then replays this move and uses that gradient to judge it.
+        # IC; l_perf then replays this move and uses that gradient to judge it, and ρ is
+        # computed from the move actually applied (step_total).
         self._chain_prev = (
             x_det, gradient, gradient_mean, gradient_std, iteration,
             gradient.pow(2).sum().clamp_min(torch.finfo(gradient.dtype).tiny),
+            step_total,
         )
 
         if self.writer is not None:
