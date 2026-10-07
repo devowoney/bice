@@ -31,6 +31,11 @@ variable per row, saved as PDF + 300-dpi PNG:
                            needs metrics/effective_resolution.csv, see
                            backfill_effective_resolution.py / gd_optimic.spectral_scores)
   psd_score_{region}_t{day}       1 - PSD(err)/PSD(truth) vs wavenumber, lambda_eff marked
+  pixelization_{scope}     checkerboard fraction of the IC update vs iteration
+                           (step / cumulative), mean ± 1 std, physical level and
+                           pixelization threshold marked. Read from
+                           metrics/optimization_history.json, or for cumulative from
+                           metrics/checkerboard_backfill.csv (backfill_checkerboard.py)
 """
 
 import sys, json, numpy as np, pandas as pd, xarray as xr, matplotlib.pyplot as plt
@@ -841,6 +846,133 @@ def aggregate_diagnostics(output_dir, all_run_dirs):
                                      output_dir / f"psd_score_{region}_t{t}")
     else:
         print("  ⚠ No effective_resolution.csv files found (run backfill_effective_resolution.py)")
+
+    # ===== PIXELIZATION (checkerboard fraction) =====
+    aggregate_pixelization(output_dir, all_run_dirs)
+
+# ============ PIXELIZATION (checkerboard fraction) ============
+# Same values as gd_optimic.metrics (not imported: gd_optimic pulls in xesmf/ESMF).
+CHECKERBOARD_PHYSICAL_LEVEL = 0.038
+CHECKERBOARD_THRESHOLD = 0.038 + 0.025
+# optimization_history.json key -> (scope, quantity)
+CHECKERBOARD_HISTORY_KEYS = {
+    'checkerboard_fraction': ('step', 'fraction'),
+    'checkerboard_fraction_cumulative': ('cumulative', 'fraction'),
+    'checkerboard_amplitude_cumulative': ('cumulative', 'amplitude'),
+}
+
+def _load_checkerboard(run_dir):
+    """Long-format rows (run_id, scope, quantity, variable, iteration, value, is_best) for one run."""
+    run_id = f"{run_dir.parent.name}/{run_dir.name}"
+    rows = []
+    hist_path = run_dir / "metrics" / "optimization_history.json"
+    if hist_path.exists():
+        try:
+            with open(hist_path) as f:
+                hist = json.load(f)
+        except Exception:
+            hist = {}
+        best_it = hist.get('best_iteration')
+        for entry in hist.get('history', []):
+            for key, (scope, quantity) in CHECKERBOARD_HISTORY_KEYS.items():
+                for var, val in (entry.get(key) or {}).items():
+                    rows.append((run_id, scope, quantity, var, entry['iteration'], val,
+                                 entry['iteration'] == best_it))
+    # Older runs: cumulative score backfilled from checkpoints + best IC (skip if logged live)
+    bf_path = run_dir / "metrics" / "checkerboard_backfill.csv"
+    if bf_path.exists() and not any(r[1] == 'cumulative' for r in rows):
+        bf = pd.read_csv(bf_path)
+        for _, r in bf.iterrows():
+            for quantity in ('fraction', 'amplitude'):
+                if pd.notna(r[quantity]):
+                    rows.append((run_id, r['scope'], quantity, r['variable'], int(r['iteration']),
+                                 float(r[quantity]), r['source'] == 'best'))
+    return rows
+
+def plot_pixelization_paper(evo, scope, n_runs, out_stem):
+    """Checkerboard fraction vs iteration: one variable per row (total last), mean ± 1 std across runs."""
+    d_scope = evo[(evo['scope'] == scope) & (evo['quantity'] == 'fraction')]
+    vars_list = [v for v in _ordered_vars(d_scope) if v != 'total'] + \
+                (['total'] if 'total' in set(d_scope['variable']) else [])
+    st = STYLE['opt']
+    with plt.rc_context(PAPER_RC):
+        fig, axes = plt.subplots(len(vars_list), 1, sharex=True, squeeze=False,
+                                 figsize=(FIG_WIDTH_IN, ROW_HEIGHT_IN * len(vars_list) + 0.5))
+        axes = axes[:, 0]
+        for idx, (ax, var) in enumerate(zip(axes, vars_list)):
+            d = d_scope[d_scope['variable'] == var].sort_values('iteration')
+            it, m, sd = d['iteration'].values, d['mean'].values, np.nan_to_num(d['std'].values)
+            ax.fill_between(it, m - sd, m + sd, color=st['color'], alpha=BAND_ALPHA, lw=0, zorder=2)
+            ax.plot(it, m, color=st['color'], lw=st['lw'], marker='o' if len(it) < 30 else None,
+                    ms=3, zorder=3)
+            ax.axhline(CHECKERBOARD_PHYSICAL_LEVEL, color=WINDOW_COLOR, lw=1.0, zorder=1)
+            ax.axhline(CHECKERBOARD_THRESHOLD, **BORDER_STYLE, zorder=4)
+            ax.set_ylabel('Checkerboard\nfraction')
+            ax.set_ylim(bottom=0)
+            ax.grid(True, axis='y')
+            if var == 'total':
+                ax.set_title(f"({chr(97 + idx)}) Mean over variables", loc='left', fontweight='bold', pad=3)
+            else:
+                _panel_label(ax, idx, var)
+        axes[-1].set_xlabel('Iteration')
+        handles = [Line2D([], [], color=st['color'], lw=st['lw'], label=f'{scope.capitalize()} IC update'),
+                   _band_handle(n_runs),
+                   Line2D([], [], color=WINDOW_COLOR, lw=1.0,
+                          label=f'Physical level ({CHECKERBOARD_PHYSICAL_LEVEL:.3f})'),
+                   Line2D([], [], **BORDER_STYLE, label=f'Pixelization threshold ({CHECKERBOARD_THRESHOLD:.3f})')]
+        fig.align_ylabels(axes)
+        fig.tight_layout(h_pad=0.5, rect=(0, 0, 1, 0.96))
+        fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 1.0), ncol=2,
+                   frameon=False, columnspacing=1.2, handlelength=1.8)
+        _save_paper_fig(fig, out_stem)
+
+def aggregate_pixelization(output_dir, all_run_dirs):
+    print("\n4. Pixelization (checkerboard fraction of the IC update)...")
+    rows = [r for run_dir in all_run_dirs for r in _load_checkerboard(run_dir)]
+    if not rows:
+        print("  ⚠ No checkerboard scores found (optimization_history.json / checkerboard_backfill.csv)")
+        return
+    cb = pd.DataFrame(rows, columns=['run_id', 'scope', 'quantity', 'variable', 'iteration', 'value', 'is_best'])
+    keys = ['run_id', 'scope', 'quantity', 'variable']
+
+    # Iteration-wise statistics across runs
+    evo = cb.groupby(['scope', 'quantity', 'variable', 'iteration'])['value'].agg(
+        n_runs='count', mean='mean', std='std').reset_index()
+    evo.to_csv(output_dir / "pixelization_evolution_aggregated.csv", index=False)
+    print(f"  ✓ pixelization_evolution_aggregated.csv ({len(evo)} rows)")
+
+    # Per-run score: last iteration ("final") and best iteration / optimized IC ("best")
+    cb = cb.sort_values('iteration', kind='stable')
+    final = cb.groupby(keys).tail(1).set_index(keys)
+    best = cb[cb['is_best']].groupby(keys).tail(1).set_index(keys)
+    per_run = pd.DataFrame({'final_iteration': final['iteration'], 'final': final['value'],
+                            'best_iteration': best['iteration'], 'best': best['value']}).reset_index()
+    is_frac = per_run['quantity'] == 'fraction'
+    for col in ('final', 'best'):
+        flag = (per_run[col] > CHECKERBOARD_THRESHOLD).astype(float)
+        per_run[f'{col}_pixelized'] = flag.where(is_frac & per_run[col].notna())
+    per_run.to_csv(output_dir / "pixelization_per_run.csv", index=False)
+    print(f"  ✓ pixelization_per_run.csv ({per_run['run_id'].nunique()} runs)")
+
+    # Summary across runs (*_share_pixelized: fraction of runs above the threshold)
+    summary = per_run.groupby(['scope', 'quantity', 'variable']).agg(
+        n_runs=('run_id', 'count'),
+        final_mean=('final', 'mean'), final_std=('final', 'std'),
+        best_mean=('best', 'mean'), best_std=('best', 'std'),
+        final_share_pixelized=('final_pixelized', 'mean'),
+        best_share_pixelized=('best_pixelized', 'mean')).reset_index()
+    summary.to_csv(output_dir / "pixelization_summary.csv", index=False)
+    with open(output_dir / "pixelization_summary.json", 'w') as f:
+        json.dump({'physical_level': CHECKERBOARD_PHYSICAL_LEVEL, 'threshold': CHECKERBOARD_THRESHOLD,
+                   'summary': json.loads(summary.to_json(orient='records'))}, f, indent=2)
+    print("  ✓ pixelization_summary.csv/.json")
+    for _, r in summary[(summary['quantity'] == 'fraction') & (summary['variable'] == 'total')].iterrows():
+        print(f"    {r['scope']:>10} total: final {r['final_mean']:.3f} ± {np.nan_to_num(r['final_std']):.3f}"
+              f", pixelized in {np.nan_to_num(r['final_share_pixelized']):.0%} of {r['n_runs']} runs")
+
+    for scope in sorted(evo.loc[evo['quantity'] == 'fraction', 'scope'].unique()):
+        n_runs = cb.loc[(cb['scope'] == scope) & (cb['quantity'] == 'fraction'), 'run_id'].nunique()
+        plot_pixelization_paper(evo, scope, n_runs, output_dir / f"pixelization_{scope}")
 
 # ============ MAIN ============
 
