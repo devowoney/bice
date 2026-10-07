@@ -102,6 +102,9 @@ diag/checkerboard/amplitude/{step,cumulative}/{var}        # RMS checkerboard co
 state/ic/{norm,update_magnitude}
 ```
 
+**Checkerboard score in `metrics/optimization_history.json`** (every iteration, `history[i]`):
+`checkerboard_fraction` (step), `checkerboard_fraction_cumulative`, `checkerboard_amplitude_cumulative`.
+
 ### 5. **metrics.py**: Evaluation Metrics
 
 **Classes:**

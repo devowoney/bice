@@ -675,16 +675,25 @@ class ICOptimizer:
             if self.use_meta_learner and history_meta_loss is not None:
                 history_entry["meta_loss"] = history_meta_loss
 
-            # Pixelization diagnostic on the step IC update (last IC timestep, [C, H, W]).
+            # Pixelization diagnostic on the step and cumulative IC update (last IC timestep, [C, H, W]).
             # Computed once here (used by history_entry unconditionally, and passed
             # to _log_to_tensorboard below when logging -- avoids recomputing it).
             step_checkerboard = None
+            cumulative_checkerboard = None
             if self._last_ic_update is not None and self._ocean_mask is not None:
                 step_checkerboard = compute_checkerboard_fraction(
                     self._last_ic_update[0, -1],
                     self._ocean_mask,
                 )
                 history_entry["checkerboard_fraction"] = step_checkerboard["fraction"]
+
+                # Cumulative correction relative to the original IC
+                cumulative_checkerboard = compute_checkerboard_fraction(
+                    x0_current[0, -1] - x0_reference[0, -1],
+                    self._ocean_mask,
+                )
+                history_entry["checkerboard_fraction_cumulative"] = cumulative_checkerboard["fraction"]
+                history_entry["checkerboard_amplitude_cumulative"] = cumulative_checkerboard["amplitude"]
 
             if regional_masks is not None:
                 history_entry["rmse_basin"] = metrics["rmse_basin"]
@@ -702,6 +711,7 @@ class ICOptimizer:
                     x0_current=x0_current,
                     x0_reference=x0_reference,
                     step_checkerboard=step_checkerboard,
+                    cumulative_checkerboard=cumulative_checkerboard,
                 )
 
             # Log histograms/embeddings less frequently
@@ -778,6 +788,7 @@ class ICOptimizer:
         x0_current: Optional[torch.Tensor] = None,
         x0_reference: Optional[torch.Tensor] = None,
         step_checkerboard: Optional[Dict[str, Dict[str, float]]] = None,
+        cumulative_checkerboard: Optional[Dict[str, Dict[str, float]]] = None,
     ):
         """
         Log metrics to TensorBoard.
@@ -787,9 +798,10 @@ class ICOptimizer:
         metrics/rmse/{global,basin}/{var}
         state/ic/{norm,update_magnitude}
 
-        step_checkerboard: optional compute_checkerboard_fraction() result already computed
-        by the caller for (self._last_ic_update, self._ocean_mask) -- passed in to avoid
-        recomputing the identical diagnostic a second time here.
+        step_checkerboard / cumulative_checkerboard: optional compute_checkerboard_fraction()
+        results already computed by the caller for the step update (self._last_ic_update) and
+        the cumulative update (x0_current - x0_reference) -- passed in to avoid recomputing
+        the identical diagnostic a second time here.
         """
         # Loss metrics (per-variable)
         per_var = loss_details["weighted_per_variable"]
@@ -829,14 +841,8 @@ class ICOptimizer:
         # amplitude: RMS checkerboard coefficient in each variable's physical units
         if step_checkerboard is not None:
             checkerboard_by_scope = {"step": step_checkerboard}
-
-            # Cumulative correction relative to the original IC
-            if x0_current is not None and x0_reference is not None:
-                cumulative_update = x0_current[0, -1] - x0_reference[0, -1]
-                checkerboard_by_scope["cumulative"] = compute_checkerboard_fraction(
-                    cumulative_update,
-                    self._ocean_mask,
-                )
+            if cumulative_checkerboard is not None:
+                checkerboard_by_scope["cumulative"] = cumulative_checkerboard
 
             for scope, result in checkerboard_by_scope.items():
                 for quantity in ("fraction", "amplitude"):
