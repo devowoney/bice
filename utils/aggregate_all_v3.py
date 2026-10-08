@@ -238,12 +238,14 @@ def plot_spatial(var_name, mean, std, lat, lon, region, out):
     fig, axes = plt.subplots(1, 2, figsize=(16, 5))
     mean_m, std_m = np.ma.masked_invalid(mean), np.ma.masked_invalid(std)
     vm = np.nanpercentile(np.abs(mean), 99)
-    im0 = axes[0].contourf(lon, lat, mean_m, levels=20, cmap='RdBu_r', vmin=-vm, vmax=vm, extend='both')
+    vm = vm if np.isfinite(vm) and vm > 0 else 1.0
+    im0 = axes[0].contourf(lon, lat, mean_m, levels=np.linspace(-vm, vm, 21), cmap='RdBu_r', extend='both')
     axes[0].set_title(f'{var_name} - Mean (Region: {region})')
     axes[0].set_xlabel('Lon'); axes[0].set_ylabel('Lat')
     plt.colorbar(im0, ax=axes[0], label=var_name)
     vs = np.nanpercentile(std, 99)
-    im1 = axes[1].contourf(lon, lat, std_m, levels=20, cmap='viridis', vmax=vs, extend='max')
+    vs = vs if np.isfinite(vs) and vs > 0 else 1.0
+    im1 = axes[1].contourf(lon, lat, std_m, levels=np.linspace(0, vs, 21), cmap='viridis', extend='max')
     axes[1].set_title(f'{var_name} - Std (Region: {region})')
     axes[1].set_xlabel('Lon'); axes[1].set_ylabel('Lat')
     plt.colorbar(im1, ax=axes[1], label='Std')
@@ -262,7 +264,8 @@ def plot_forecast_anomaly_frame(var_name, mean_t, std_t, lat, lon, region, ax_me
     std_m = np.ma.masked_invalid(std_t)
     
     vm = np.nanpercentile(np.abs(mean_t), 99)
-    im0 = ax_mean.contourf(lon, lat, mean_m, levels=20, cmap='RdBu_r', vmin=-vm, vmax=vm, extend='both')
+    vm = vm if np.isfinite(vm) and vm > 0 else 1.0
+    im0 = ax_mean.contourf(lon, lat, mean_m, levels=np.linspace(-vm, vm, 21), cmap='RdBu_r', extend='both')
     ax_mean.set_xlabel('Lon'); ax_mean.set_ylabel('Lat')
     ax_mean.set_title(f'{var_name} Mean')
     if not hasattr(ax_mean, '_cbar_mean'):
@@ -270,7 +273,8 @@ def plot_forecast_anomaly_frame(var_name, mean_t, std_t, lat, lon, region, ax_me
         ax_mean._cbar_mean = cbar0
     
     vs = np.nanpercentile(std_t, 99)
-    im1 = ax_std.contourf(lon, lat, std_m, levels=20, cmap='viridis', vmax=vs, extend='max')
+    vs = vs if np.isfinite(vs) and vs > 0 else 1.0
+    im1 = ax_std.contourf(lon, lat, std_m, levels=np.linspace(0, vs, 21), cmap='viridis', extend='max')
     ax_std.set_xlabel('Lon'); ax_std.set_ylabel('Lat')
     ax_std.set_title(f'{var_name} Std')
     if not hasattr(ax_std, '_cbar_std'):
@@ -315,13 +319,15 @@ def create_forecast_anomaly_gif(output_dir, all_run_dirs, diffs_dict, lat, lon, 
         std_m = np.ma.masked_invalid(std_c)
         
         vm = np.nanpercentile(np.abs(mean_c), 99) if np.isfinite(mean_c).any() else 1.0
-        im0 = ax_mean.contourf(lon_c, lat_c, mean_m, levels=15, cmap='RdBu_r', vmin=-vm, vmax=vm, extend='both')
+        vm = vm if np.isfinite(vm) and vm > 0 else 1.0
+        im0 = ax_mean.contourf(lon_c, lat_c, mean_m, levels=np.linspace(-vm, vm, 16), cmap='RdBu_r', extend='both')
         ax_mean.set_xlabel('Lon'); ax_mean.set_ylabel('Lat')
         ax_mean.set_title(f'{var_name} Mean - T{t:02d}')
         plt.colorbar(im0, ax=ax_mean, label=var_name)
         
         vs = np.nanpercentile(std_c, 99) if np.isfinite(std_c).any() else 1.0
-        im1 = ax_std.contourf(lon_c, lat_c, std_m, levels=15, cmap='viridis', vmax=vs, extend='max')
+        vs = vs if np.isfinite(vs) and vs > 0 else 1.0
+        im1 = ax_std.contourf(lon_c, lat_c, std_m, levels=np.linspace(0, vs, 16), cmap='viridis', extend='max')
         ax_std.set_xlabel('Lon'); ax_std.set_ylabel('Lat')
         ax_std.set_title(f'{var_name} Std - T{t:02d}')
         plt.colorbar(im1, ax=ax_std, label='Std')
