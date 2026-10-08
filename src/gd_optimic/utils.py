@@ -18,6 +18,24 @@ import torch.nn as nn
 import xarray as xr
 import xesmf as xe
 
+
+def coverage_percent(obs_mode):
+    """
+    Parse observations.mode as a random-coverage percentage.
+
+    Returns:
+        int in [0, 100] if obs_mode is an integer (or digit string, e.g. "30"), else None for named modes
+    """
+    if isinstance(obs_mode, bool):
+        return None
+    if isinstance(obs_mode, str) and obs_mode.isdigit():
+        obs_mode = int(obs_mode)
+    if not isinstance(obs_mode, int):
+        return None
+    if not 0 <= obs_mode <= 100:
+        raise ValueError(f"observations.mode coverage must be in [0, 100], got {obs_mode}")
+    return obs_mode
+
 logger = logging.getLogger(__name__)
 
 # Import glonet utilities (assumes they are in sys.path or installed)
@@ -94,6 +112,7 @@ class MaskBuilder:
         ssh_nanmask: np.ndarray = None,
         sst_nanmask: np.ndarray = None,
         obs_mode: str = "full",
+        seed: int = 0,
     ) -> torch.Tensor:
         """
         Create observation mask indicating where observations are available.
@@ -107,6 +126,8 @@ class MaskBuilder:
                 - 'full': all ocean pixels observed (idealized twin/ceiling check)
                 - 'simulated': realistic observation coverage with GLORYS12 truth (OSSE)
                 - 'real': real satellite observations (OSE)
+                - int 0-100: random coverage, % of ocean pixels observed per time step (all variables)
+            seed: int - RNG seed for random coverage mode (A5 reproducibility)
 
         Returns:
             obs_mask: torch.Tensor [T, C, H, W] - observation mask
@@ -161,9 +182,23 @@ class MaskBuilder:
             # SSS, U, V are not directly observed in satellite data
             obs_mask[:, 2:5, :, :] = 0.0
 
+        elif coverage_percent(obs_mode) is not None:
+            # Random coverage: keep exactly round(pct% * N_ocean) ocean pixels per time step,
+            # drawn independently for each time and shared by all 5 variables
+            pct = coverage_percent(obs_mode)
+            gen = torch.Generator().manual_seed(seed)
+            ocean_idx = (base_ocean_mask[0].flatten() > 0).nonzero().squeeze(1).cpu()  # surface ocean pixels
+            n_keep = round(pct / 100.0 * ocean_idx.numel())
+            H, W = obs_mask.shape[-2:]
+            for t in range(obs_length):
+                keep = ocean_idx[torch.randperm(ocean_idx.numel(), generator=gen)[:n_keep]]
+                coverage = torch.zeros(H * W, device=obs_mask.device)
+                coverage[keep.to(obs_mask.device)] = 1.0
+                obs_mask[t] *= coverage.view(1, H, W)  # broadcast over channels
+
         else:
             raise ValueError(
-                f"Unknown obs_mode: {obs_mode}. Must be 'full', 'simulated', or 'real'"
+                f"Unknown obs_mode: {obs_mode}. Must be 'full', 'simulated', 'real' or an integer 0-100"
             )
 
         return obs_mask

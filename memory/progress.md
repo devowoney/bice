@@ -392,3 +392,26 @@
 - **Validation:** `python3 -m py_compile`-equivalent (`ast.parse`) passed on `loss.py`; no end-to-end run executed yet.
 - **Status:** Feature implemented, not yet run. Next: smoke-test with `loss.weighting=dynamic loss.dynamic.only_first_iteration=true` and compare against unfrozen dynamic weighting.
 
+
+## 2026-10-07 — Observation quality control: `observations.noise` + integer `observations.mode` — IMPLEMENTED ✅
+
+- **Context:** Branch/worktree `observation-quality` (`.claude/worktrees/observation-quality`, from local `main` b0025a4).
+  Goal: control observation quality (noise level, spatial coverage) in the OSSE twin.
+- **Config (all 3 configs, `observations:`):**
+  - `mode: <int 0-100>` — random coverage: exactly round(p% × N_ocean) ocean pixels per time step, new draw each time step,
+    shared by all 5 variables (∩ each channel's ocean mask; U/V have 19 fewer ocean pixels than SSH/T/S). Target is GLORYS12 truth.
+  - `noise: false` (feature flag), `noise_scale: 1.0` — Gaussian noise, sigma_c(x,y) = noise_scale × RMS_t(x_c − mean_c) over the
+    observation window, mean_c from `data.stats_file` (ch 0-4). Applied before observation operators; rejected with `mode: real`.
+  - `seed: 0` — effective seed = seed + sample_idx (noise and coverage).
+- **Code:** `data.py` `ObservationOperator.add_gaussian_noise`; `utils.py` `coverage_percent()` + integer branch in
+  `MaskBuilder.build_obs_mask(seed=)`; entrypoints (`run_optimization.py`, `_slurm.py`, `_slurm_parallel.py`): satellite files /
+  operators now gated by `mode in ("simulated", "real")` (was `!= "full"`), noise call + seed wiring.
+- **Verification (`.tmp/obs_quality/verify_obs_quality.py`, real 2021 data, sample 0, T=7):** coverage frac exact for 0/5/30/100%,
+  no land pixels, reproducible, varies with time & seed, 100% == full; noise std(noise/sigma)=1.000±0.0004 for all 5 vars at
+  scale 1.0 and 0.5, land untouched, reproducible; sigma Gulf Stream / subtropical gyre ratio 2.3–4.5 (high-variability regions noisier).
+- **Caveat:** 7-day window RMS vs yearly mean includes the seasonal offset (e.g. mean sigma_T = 1.3 °C in Jan).
+- **Status:** Not committed (awaiting pilot authorization). No end-to-end optimization run yet.
+- **2026-10-08 — Observation mask figure:** `output_handler.save_obs_mask_figure()` writes `diagnostics/obs_mask.png` once per run,
+  right after `build_obs_mask` (all 3 entrypoints; `_slurm_parallel` → `gpu{rank}_sample{idx}/diagnostics/`). Columns = 5 variables,
+  rows = first/middle/last observation step (blue observed / white ocean not observed / gray land, % of ocean in titles) + a count row
+  (observed steps per pixel). Plotting errors only log a warning. Render check: `.tmp/obs_quality/render_obs_mask.py <modes...>`.

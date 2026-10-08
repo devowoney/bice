@@ -1846,3 +1846,92 @@ class OutputHandler:
         ds.attrs['wavenumber_description'] = 'Normalized wavenumber bins (cycles per grid point)'
         
         return ds
+
+
+def save_obs_mask_figure(
+    obs_mask: torch.Tensor,
+    ocean_mask: torch.Tensor,
+    input_sequence: xr.Dataset,
+    out_dir: Path,
+    title: str = "",
+) -> Optional[Path]:
+    """
+    Save a map of the observation mask (where the loss sees observations) as `obs_mask.png`.
+
+    Layout: columns = the 5 variables [SSH, T, S, U, V]; rows = first / middle / last observation
+    time step (all steps if T <= 3), plus a last row with the number of observed steps per pixel.
+    Each panel title gives the coverage as % of that variable's ocean pixels.
+
+    Args:
+        obs_mask: Observation mask [T, C, H, W] (1 = observed)
+        ocean_mask: Ocean mask [C, H, W] (only the first 5 channels are used)
+        input_sequence: Dataset providing lat/lon coords for the map extent
+        out_dir: Directory to write the figure in (created if missing)
+        title: Figure title (e.g. observation mode and seed)
+
+    Returns:
+        Path to the PNG, or None if plotting failed (a plotting error never stops the run)
+    """
+    from matplotlib.colors import ListedColormap
+
+    try:
+        obs = obs_mask.detach().cpu().numpy()[:, :5] > 0      # [T, 5, H, W]
+        ocean = ocean_mask.detach().cpu().numpy()[:5] > 0      # [5, H, W]
+        n_t = obs.shape[0]
+        steps = list(range(n_t)) if n_t <= 3 else [0, n_t // 2, n_t - 1]
+
+        lat = input_sequence.coords["lat"].values
+        lon = input_sequence.coords["lon"].values
+        extent = (float(lon.min()), float(lon.max()), float(lat.min()), float(lat.max()))
+        origin = "lower" if lat[0] < lat[-1] else "upper"
+
+        # Categorical map: 0 = land, 1 = ocean not observed, 2 = observed
+        state_cmap = ListedColormap(["#bdbdbd", "#f2f2f2", "#08519c"])
+        count_cmap = plt.get_cmap("viridis").copy()
+        count_cmap.set_bad("#bdbdbd")  # land
+
+        fig, axes = plt.subplots(
+            len(steps) + 1, 5, figsize=(22, 2.6 * (len(steps) + 1)), squeeze=False, constrained_layout=True
+        )
+        for c in range(5):
+            var_name = OutputHandler.VAR_METADATA[c][0]
+            n_ocean = max(int(ocean[c].sum()), 1)
+
+            for row, t in enumerate(steps):
+                state = ocean[c].astype(np.int8) + (obs[t, c] & ocean[c])
+                pct = 100.0 * (obs[t, c] & ocean[c]).sum() / n_ocean
+                ax = axes[row, c]
+                ax.imshow(state, cmap=state_cmap, vmin=0, vmax=2, extent=extent, origin=origin,
+                          aspect="auto", interpolation="nearest")
+                ax.set_title(f"{var_name} | t={t} | {pct:.1f}% of ocean", fontsize=10)
+
+            # Last row: how many of the T steps observe each pixel
+            count = np.where(ocean[c], (obs[:, c] & ocean[c]).sum(axis=0), np.nan)
+            mean_pct = 100.0 * np.nanmean(count) / n_t
+            ax = axes[-1, c]
+            im = ax.imshow(count, cmap=count_cmap, vmin=0, vmax=n_t, extent=extent, origin=origin,
+                           aspect="auto", interpolation="nearest")
+            ax.set_title(f"{var_name} | observed steps / {n_t} | mean {mean_pct:.1f}%", fontsize=10)
+
+        for ax in axes.flat:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        for row, t in enumerate(steps):
+            axes[row, 0].set_ylabel(f"t = {t}", fontsize=10)
+        axes[-1, 0].set_ylabel("count", fontsize=10)
+        fig.colorbar(im, ax=axes[-1, :].tolist(), fraction=0.02, pad=0.01, label="observed steps")
+        fig.suptitle(f"Observation mask  (blue = observed, white = ocean not observed, gray = land)  {title}",
+                     fontsize=13)
+
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "obs_mask.png"
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        logger.info(f"✓ Saved observation mask figure: {out_path}")
+        return out_path
+
+    except Exception as e:
+        logger.warning(f"Failed to save observation mask figure: {e}")
+        plt.close("all")
+        return None

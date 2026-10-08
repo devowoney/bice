@@ -6,6 +6,7 @@ Provides:
     - ObservationOperator: Apply observation operators (SSH along-track, SST gridded)
 """
 
+import warnings
 import xarray as xr
 import numpy as np
 import torch
@@ -507,3 +508,50 @@ class ObservationOperator:
 
         else:
             raise ValueError(f"Unknown obs_mode: {obs_mode}")
+
+    def add_gaussian_noise(
+        self,
+        model_state: xr.Dataset,
+        mean_field: Optional[xr.DataArray],
+        noise_scale: float = 1.0,
+        seed: int = 0,
+    ) -> xr.Dataset:
+        """
+        Add Gaussian observation noise to the 5 core channels [SSH, T, S, U, V] (feature flag: observations.noise).
+
+        The noise std is per variable and per pixel, set by the temporal anomaly of the observed window:
+            sigma_c(x, y) = noise_scale * sqrt( mean_t[ (x_c(t, x, y) - mean_c(x, y))^2 ] )
+        where mean_c is the yearly mean from data.stats_file. sigma is therefore large where the dynamics
+        depart strongly from the mean (chaotic / high-variance regions) and small in quiet regions.
+
+        Args:
+            model_state: Target sequence dataset, data [T, C, H, W] (C >= 5)
+            mean_field: Stats-file mean DataArray [ch, lat, lon] (data.stats_file)
+            noise_scale: Multiplier on the anomaly RMS (1.0 = noise std equals anomaly std)
+            seed: RNG seed (A5 reproducibility)
+
+        Returns:
+            model_state: Dataset with noisy channels 0-4 (land / NaN pixels left untouched)
+        """
+        if mean_field is None:
+            raise ValueError("observations.noise requires data.stats_file (mean field) to compute the anomaly")
+
+        # Clean observed signal for the 5 core channels: [T, 5, H, W]
+        signal = model_state["data"][:, 0:5, :, :].values.astype(np.float64)
+
+        # Yearly mean of the same channels on the target grid: [5, H, W]
+        mean = self.align_grid(mean_field.isel(ch=slice(0, 5)), model_state).values
+
+        # Per-pixel anomaly RMS over the observation window -> noise std [5, H, W]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN land pixels -> NaN, zeroed below
+            sigma = noise_scale * np.sqrt(np.nanmean((signal - mean[None]) ** 2, axis=0))
+        sigma = np.nan_to_num(sigma, nan=0.0)  # land / missing mean -> no noise
+
+        # Independent Gaussian draw for every (t, c, x, y), scaled by the local std
+        rng = np.random.default_rng(seed)
+        noise = rng.standard_normal(signal.shape) * sigma[None]
+
+        model_state["data"][:, 0:5, :, :] = (signal + noise).astype(model_state["data"].dtype)
+
+        return model_state

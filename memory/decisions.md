@@ -339,3 +339,14 @@ python run_optimization.py observations.mode=simulated  # Override params
 **CS1 Compliance**: All code human-readable, extensively commented, simple structure.
 
 **Status**: R10(j) complete ✅ | Phase B research 10/10 complete → ready for Phase P
+
+## 2026-10-07 — Observation quality control (branch `observation-quality`)
+
+- **Noise = Gaussian only.** Dynamic noise dropped (user): a per-pixel sigma from the anomaly already makes noise larger in chaotic regions.
+- **sigma source = RMS over the observation window of (x − stats_file mean)** (user choice). No std file exists — every `stats/` folder
+  holds only `mean.nc`; GloNet `TrainedWeights/L0/*_std.npy` are global scalars of the full field, not anomaly std. Alternative
+  (precompute yearly per-pixel std.nc) was offered and declined for now.
+- **`noise_scale` knob** (default 1.0 = noise std equals anomaly std) to sweep SNR.
+- **Coverage mode:** integer `observations.mode` (0-100 = % of ocean pixels), random per time step, shared across channels (user choice).
+- **Noise before operators, never with `mode: real`** (A7: no synthetic perturbation of real observations). Ground truth stays clean (A2).
+- **Seed = observations.seed + sample_idx** so batch samples get different but reproducible patterns (A5).

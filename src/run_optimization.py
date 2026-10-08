@@ -14,6 +14,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 import torch
 import numpy as np
+import xarray as xr
 from pathlib import Path
 from datetime import datetime
 import sys
@@ -34,6 +35,7 @@ from gd_optimic import (
     ForwardModel,
 )
 from gd_optimic.gradient import ScheduledPooling
+from gd_optimic.output_handler import save_obs_mask_figure
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="optimize_ic")
@@ -76,8 +78,8 @@ def main(cfg: DictConfig):
     dataset = GlonetDataset(
         data_path=cfg.data.root_path,
         data_files=cfg.data.init_state_files,
-        ssh_obs_files=cfg.data.ssh_obs_files if cfg.observations.mode != 'full' else None,
-        sst_obs_files=cfg.data.sst_obs_files if cfg.observations.mode != 'full' else None,
+        ssh_obs_files=cfg.data.ssh_obs_files if cfg.observations.mode in ("simulated", "real") else None,
+        sst_obs_files=cfg.data.sst_obs_files if cfg.observations.mode in ("simulated", "real") else None,
         lazy_load=True
     )
     
@@ -118,9 +120,20 @@ def main(cfg: DictConfig):
     logger.info("Applying observation operators...")
     obs_operator = ObservationOperator(device=device)
      
+    # Feature flag observations.noise: Gaussian noise on the observed target, applied before the
+    # observation operators so 'simulated' coverage masks the noisy truth (never on real obs, A7)
+    obs_seed = cfg.observations.get("seed", 0) + cfg.data.sample_idx
+    if cfg.observations.get("noise", False):
+        mean_field = xr.open_dataset(cfg.data.stats_file)["data"] if cfg.data.get("stats_file", None) else None
+        if cfg.observations.mode == "real":
+            raise ValueError("observations.noise is only for synthetic observations, not mode='real'")
+        target_sequence = obs_operator.add_gaussian_noise(
+            target_sequence, mean_field, cfg.observations.get("noise_scale", 1.0), seed=obs_seed
+        )
+
     # SSH observations
     ssh_mask = None
-    if cfg.observations.mode != 'full':
+    if cfg.observations.mode in ("simulated", "real"):
         ssh_obs = dataset.get_ssh_obs(target_start_idx, cfg.data.observation_length)
         stats_field = None  # Load stats file (MDT/climatology or SSH stats) if obs_mode='real'
          
@@ -133,7 +146,7 @@ def main(cfg: DictConfig):
      
     # SST observations
     sst_mask = None
-    if cfg.observations.mode != 'full':
+    if cfg.observations.mode in ("simulated", "real"):
         sst_obs = dataset.get_sst_obs(target_start_idx, cfg.data.observation_length)
          
         target_sequence, sst_mask = obs_operator.apply_sst_operator(
@@ -167,7 +180,12 @@ def main(cfg: DictConfig):
         cfg.data.observation_length,
         ssh_nanmask=ssh_mask,
         sst_nanmask=sst_mask,
-        obs_mode=cfg.observations.mode
+        obs_mode=cfg.observations.mode,
+        seed=obs_seed
+    )
+    save_obs_mask_figure(
+        obs_mask, ocean_mask, input_sequence, Path(cfg.logging.output_dir) / exp_id / "diagnostics",
+        title=f"| mode={cfg.observations.mode} | seed={obs_seed}",
     )
     
     logger.info(f"Created masks")

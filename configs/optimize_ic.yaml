@@ -74,6 +74,12 @@ observations:
                  # 'full': GLORYS12 everywhere (idealized twin/ceiling check)
                  # 'simulated': GLORYS12 with realistic obs coverage (OSSE)
                  # 'real': Satellite SSH + SST (OSE)
+                 # <int 0-100>: random coverage, % of ocean pixels observed per time step
+                 #              (new draw each time step, shared by all 5 variables; GLORYS12 truth)
+  noise: false        # Feature flag: add Gaussian noise to the observed target (not allowed with 'real')
+  noise_scale: 1.0    # sigma_c(x,y) = noise_scale * RMS_t(x_c - mean_c) over the observation window,
+                      # mean_c from data.stats_file -> larger noise in high-variability regions
+  seed: 0             # RNG seed for noise and random coverage (effective seed = seed + sample_idx, A5)
   
   # Observation operators follow R2 decisions
   ssh_operator: "nearest_neighbor"  # Along-track → nearest-neighbor interpolation

@@ -38,6 +38,7 @@ from gd_optimic import (
     ForwardModel,
     ScheduledPooling,
 )
+from gd_optimic.output_handler import save_obs_mask_figure
 
 def setup_slurm_environment(cfg: DictConfig) -> DictConfig:
     """
@@ -187,8 +188,8 @@ def main(cfg: DictConfig):
     dataset = GlonetDataset(
         data_path=cfg.data.root_path,
         data_files=cfg.data.init_state_files,
-        ssh_obs_files=cfg.data.ssh_obs_files if cfg.observations.mode != "full" else None,
-        sst_obs_files=cfg.data.sst_obs_files if cfg.observations.mode != "full" else None,
+        ssh_obs_files=cfg.data.ssh_obs_files if cfg.observations.mode in ("simulated", "real") else None,
+        sst_obs_files=cfg.data.sst_obs_files if cfg.observations.mode in ("simulated", "real") else None,
         lazy_load=True,
     )
 
@@ -242,10 +243,20 @@ def main(cfg: DictConfig):
             logger.warning(f"Failed to load stats file {cfg.data.stats_file}: {e}")
             stats_field = None
 
+    # Feature flag observations.noise: Gaussian noise on the observed target, applied before the
+    # observation operators so 'simulated' coverage masks the noisy truth (never on real obs, A7)
+    obs_seed = cfg.observations.get("seed", 0) + cfg.data.sample_idx
+    if cfg.observations.get("noise", False):
+        if cfg.observations.mode == "real":
+            raise ValueError("observations.noise is only for synthetic observations, not mode='real'")
+        target_sequence = obs_operator.add_gaussian_noise(
+            target_sequence, stats_field, cfg.observations.get("noise_scale", 1.0), seed=obs_seed
+        )
+
     ssh_mask = None
     sst_mask = None
 
-    if cfg.observations.mode != "full":
+    if cfg.observations.mode in ("simulated", "real"):
         ssh_obs = dataset.get_ssh_obs(target_start_idx, cfg.data.observation_length)
         target_sequence, ssh_mask = obs_operator.apply_ssh_operator(
             target_sequence, ssh_obs, cfg.observations.mode, mdt=stats_field
@@ -279,6 +290,11 @@ def main(cfg: DictConfig):
         ssh_nanmask=ssh_mask,
         sst_nanmask=sst_mask,
         obs_mode=cfg.observations.mode,
+        seed=obs_seed,
+    )
+    save_obs_mask_figure(
+        obs_mask, ocean_mask, input_sequence, Path("diagnostics"),
+        title=f"| mode={cfg.observations.mode} | seed={obs_seed}",
     )
 
     logger.info("Created masks")
