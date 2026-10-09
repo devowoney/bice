@@ -427,3 +427,7 @@
 - **2026-10-08 — Noise sigma made global per variable:** `add_gaussian_noise` now uses one scalar sigma_c per channel
   (anomaly RMS over window and ocean pixels) instead of a per-pixel map; still i.i.d. per (t, x, y), ocean only.
   Check: `.tmp/obs_quality/verify_scalar_noise.py`.
+- **2026-10-09 — `initial_condition.noise` added:** config block in all 3 configs; IC noise call in all 3 entrypoints
+  right after the observation-noise call (`run_optimization.py` now loads the stats mean once for either flag).
+  `ic_rmse` keeps measuring drift from the (noisy) starting IC, not distance to the clean truth.
+  Check: `.tmp/obs_quality/verify_ic_noise.py`.

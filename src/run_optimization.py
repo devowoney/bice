@@ -123,12 +123,24 @@ def main(cfg: DictConfig):
     # Feature flag observations.noise: Gaussian noise on the observed target, applied before the
     # observation operators so 'simulated' coverage masks the noisy truth (never on real obs, A7)
     obs_seed = cfg.observations.get("seed", 0) + cfg.data.sample_idx
-    if cfg.observations.get("noise", False):
+    ic_noise_cfg = cfg.get("initial_condition", {})
+    mean_field = None
+    if cfg.observations.get("noise", False) or ic_noise_cfg.get("noise", False):
         mean_field = xr.open_dataset(cfg.data.stats_file)["data"] if cfg.data.get("stats_file", None) else None
+    if cfg.observations.get("noise", False):
         if cfg.observations.mode == "real":
             raise ValueError("observations.noise is only for synthetic observations, not mode='real'")
         target_sequence = obs_operator.add_gaussian_noise(
             target_sequence, mean_field, cfg.observations.get("noise_scale", 1.0), seed=obs_seed
+        )
+
+    # Feature flag initial_condition.noise: Gaussian noise on the IC (first guess x0_init, reference
+    # forecast and saved initial IC all use it; ground truth stays clean, A2). Stream 1 keeps the draw
+    # independent of the observation noise even when both seeds are equal.
+    if ic_noise_cfg.get("noise", False):
+        ic_seed = ic_noise_cfg.get("seed", 0) + cfg.data.sample_idx
+        input_sequence = obs_operator.add_gaussian_noise(
+            input_sequence, mean_field, ic_noise_cfg.get("noise_scale", 1.0), seed=[ic_seed, 1]
         )
 
     # SSH observations

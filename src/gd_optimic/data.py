@@ -10,7 +10,7 @@ import xarray as xr
 import numpy as np
 import torch
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Sequence, Union
 import xesmf as xe
 
 
@@ -513,27 +513,29 @@ class ObservationOperator:
         model_state: xr.Dataset,
         mean_field: Optional[xr.DataArray],
         noise_scale: float = 1.0,
-        seed: int = 0,
+        seed: Union[int, Sequence[int]] = 0,
     ) -> xr.Dataset:
         """
-        Add Gaussian observation noise to the 5 core channels [SSH, T, S, U, V] (feature flag: observations.noise).
+        Add Gaussian noise to the 5 core channels [SSH, T, S, U, V] of a sequence.
+        Used for the observed target (feature flag: observations.noise) and for the initial
+        condition (feature flag: initial_condition.noise).
 
-        White noise with one std per variable, set by the global anomaly RMS of the observed window:
+        White noise with one std per variable, set by the global anomaly RMS of the given window:
             sigma_c = noise_scale * sqrt( mean_{t, ocean x, y}[ (x_c(t, x, y) - mean_c(x, y))^2 ] )
         where mean_c is the yearly mean from data.stats_file. The same sigma_c is used everywhere in the
         ocean; the draw is independent for every (t, x, y) and every variable.
 
         Args:
-            model_state: Target sequence dataset, data [T, C, H, W] (C >= 5)
+            model_state: Sequence dataset (target or IC), data [T, C, H, W] (C >= 5)
             mean_field: Stats-file mean DataArray [ch, lat, lon] (data.stats_file)
             noise_scale: Multiplier on the anomaly RMS (1.0 = noise std equals anomaly std)
-            seed: RNG seed (A5 reproducibility)
+            seed: RNG seed, int or list of ints for a separate stream (A5 reproducibility)
 
         Returns:
             model_state: Dataset with noisy channels 0-4 (land / NaN pixels left untouched)
         """
         if mean_field is None:
-            raise ValueError("observations.noise requires data.stats_file (mean field) to compute the anomaly")
+            raise ValueError("Gaussian noise requires data.stats_file (mean field) to compute the anomaly")
 
         # Clean observed signal for the 5 core channels: [T, 5, H, W]
         signal = model_state["data"][:, 0:5, :, :].values.astype(np.float64)

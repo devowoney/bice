@@ -87,6 +87,13 @@ observations:
   sst_operator: "direct_pixel"      # Gridded L3 → direct pixel match
   qc_strategy: "light"              # Trust CMEMS L3 pre-filtering
 
+# Initial condition quality (synthetic background error)
+initial_condition:
+  noise: false        # Feature flag: add Gaussian noise to the IC (first guess x0_init); ground truth stays clean
+  noise_scale: 1.0    # white noise, one std per variable: sigma_c = noise_scale * RMS(x_c - mean_c) over
+                      # the IC window (sequence_length steps) and all ocean pixels, mean_c from data.stats_file
+  seed: 0             # RNG seed (effective seed = seed + sample_idx, separate stream from observation noise, A5)
+
 # Loss configuration
 loss:
   weighting: "manual"  # Options: 'dynamic', 'manual'

@@ -356,3 +356,9 @@ python run_optimization.py observations.mode=simulated  # Override params
 - **2026-10-08 — Coverage = random 10×10 lat/lon blocks, fixed in time (user).** Replaces random pixels: scattered pixels redrawn
   daily left only 0.5^7 ≈ 0.8% of pixels never seen at 50%, so coverage barely changed the result. pct% → pct blocks of 100
   (land blocks count, so ocean coverage ≠ pct exactly).
+- **2026-10-09 — IC noise = same white-noise recipe as observation noise (user).** New `initial_condition:` block
+  (`noise`, `noise_scale`, `seed`): sigma_c = noise_scale × anomaly RMS over the IC window (sequence_length steps × ocean
+  pixels, vs stats_file mean), reusing `add_gaussian_noise`. Applied to `input_sequence`, so x0_init, the reference forecast
+  and the saved initial IC are all the noisy background; ground truth stays clean (A2). Allowed with `mode: real` (the IC is
+  GLORYS, not a real observation). RNG = `default_rng([seed + sample_idx, 1])`: with a plain int seed equal to the obs seed
+  the IC draw would copy the first 2 steps of the obs-noise draw (correlated errors).

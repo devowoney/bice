@@ -303,6 +303,16 @@ def run_optimization_on_batch(
                 target_sequence, stats_field, cfg.observations.get("noise_scale", 1.0), seed=obs_seed
             )
 
+        # Feature flag initial_condition.noise: Gaussian noise on the IC (first guess x0_init, reference
+        # forecast and saved initial IC all use it; ground truth stays clean, A2). Stream 1 keeps the draw
+        # independent of the observation noise even when both seeds are equal.
+        ic_noise_cfg = cfg.get("initial_condition", {})
+        if ic_noise_cfg.get("noise", False):
+            ic_seed = ic_noise_cfg.get("seed", 0) + sample_idx
+            input_sequence = obs_operator.add_gaussian_noise(
+                input_sequence, stats_field, ic_noise_cfg.get("noise_scale", 1.0), seed=[ic_seed, 1]
+            )
+
         ssh_mask = None
         sst_mask = None
 
