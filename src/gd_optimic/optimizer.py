@@ -574,6 +574,9 @@ class ICOptimizer:
             elif one_task_inference:
                 # Frozen meta-learner: same inner loop as step() (fixed outer gradient,
                 # iteration k), without the meta-optimization.
+                # No extra forward pass after the move: like plain GD, this iteration reports
+                # the loss/forecast already computed above for the gradient, i.e. at the IC
+                # before the move (x_eval below). The last move is evaluated after the loop.
                 with torch.no_grad():
                     x_outer_before = x0_current.detach()
                     x_inner = x_outer_before
@@ -590,8 +593,6 @@ class ICOptimizer:
                                 x_inner, masked_gradients, gradient_mean, gradient_std, iteration
                             )
                             x_inner = x_inner - ic_update
-                    _, y_hat_steps = self.forward_model.forward(x_inner, num_forecast_steps)
-                    loss, loss_details = self.loss_fn(y_hat_steps, target_sequence, return_details=True)
                     self._last_ic_update = (x_outer_before - x_inner).cpu().clone()
                 x0_current = x_inner.detach().requires_grad_(True)
             else:
@@ -629,6 +630,9 @@ class ICOptimizer:
                 # Detach x0_current for next outer iteration to avoid graph growth
                 x0_current = x0_current.detach().requires_grad_(True)
 
+            # IC that loss/y_hat_steps belong to (frozen one-task inference reports the pre-move IC)
+            x_eval = x_outer_before if one_task_inference else x0_current
+
             # Compute metrics (with no_grad to save memory)
             with torch.no_grad():
                 # Use last forecast step for evaluation
@@ -638,7 +642,7 @@ class ICOptimizer:
                 metrics = self.metrics_computer.compute_all_metrics(
                     y_hat_final,
                     target_final,
-                    x0_current,
+                    x_eval,
                     x0_reference,
                     regional_masks=regional_masks,
                 )
@@ -647,7 +651,7 @@ class ICOptimizer:
             if loss.item() < self.best_loss:
                 self.best_loss = loss.item()
                 self.best_iteration = iteration + 1
-                self.best_x0 = x0_current.detach().clone()
+                self.best_x0 = x_eval.detach().clone()
                 self.best_predictions = y_hat_steps.detach().clone()
                 # Cache network_s weights in memory (cheap CPU copy, no disk I/O)
                 # so the true best-loss meta-learner state can be persisted at the
@@ -708,7 +712,7 @@ class ICOptimizer:
                     loss_details,
                     metrics,
                     current_kernel,
-                    x0_current=x0_current,
+                    x0_current=x_eval,
                     x0_reference=x0_reference,
                     step_checkerboard=step_checkerboard,
                     cumulative_checkerboard=cumulative_checkerboard,
@@ -717,7 +721,7 @@ class ICOptimizer:
             # Log histograms/embeddings less frequently
             if (iteration + 1) % self.histogram_frequency == 0:
                 self._log_histograms_to_tensorboard(
-                    iteration + 1, masked_gradients, x0_current, ocean_mask
+                    iteration + 1, masked_gradients, x_eval, ocean_mask
                 )
 
             # Print progress
@@ -729,7 +733,7 @@ class ICOptimizer:
             # is never silently dropped.
             is_last_iteration = (iteration + 1) == self.num_iterations
             if (iteration + 1) % self.save_frequency == 0 or is_last_iteration:
-                self._save_checkpoint(iteration + 1, x0_current, y_hat_steps)
+                self._save_checkpoint(iteration + 1, x_eval, y_hat_steps)
 
                 # Save meta-learner checkpoint if enabled (frozen in inference: nothing new to save)
                 if self.use_meta_learner and self.meta_learner is not None and not inference_mode:
@@ -747,6 +751,32 @@ class ICOptimizer:
                 gc.collect()
                 if self.device == "cuda":
                     torch.cuda.empty_cache()
+
+        # Frozen one-task inference reports each iteration at its pre-move IC, so the last
+        # move is still unevaluated: one forward pass for it (recorded as iteration N+1).
+        if one_task_inference and self.num_iterations > 0:
+            with torch.no_grad():
+                _, y_hat_steps = self.forward_model.forward(x0_current, num_forecast_steps)
+                loss, _ = self.loss_fn(y_hat_steps, target_sequence, return_details=True)
+                metrics = self.metrics_computer.compute_all_metrics(
+                    y_hat_steps[:, -1, :, :, :], target_sequence[:, -1, :, :, :],
+                    x0_current, x0_reference,
+                    regional_masks=regional_masks,
+                )
+            self.history.append({
+                "iteration": self.num_iterations + 1,
+                "loss": loss.item(),
+                "kernel_size": 1,
+                "rmse_global": metrics["rmse_global"],
+                "ic_rmse": metrics["ic_rmse"],
+            })
+            if loss.item() < self.best_loss:
+                self.best_loss = loss.item()
+                self.best_iteration = self.num_iterations + 1
+                self.best_x0 = x0_current.detach().clone()
+                self.best_predictions = y_hat_steps.detach().clone()
+            self.writer.add_scalar("loss/J_obs/total", loss.item(), self.num_iterations + 1)
+            del y_hat_steps, loss
 
         # Final logging
         logger.info(f"\n{'='*60}")
