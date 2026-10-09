@@ -415,3 +415,15 @@
   right after `build_obs_mask` (all 3 entrypoints; `_slurm_parallel` → `gpu{rank}_sample{idx}/diagnostics/`). Columns = 5 variables,
   rows = first/middle/last observation step (blue observed / white ocean not observed / gray land, % of ocean in titles) + a count row
   (observed steps per pixel). Plotting errors only log a warning. Render check: `.tmp/obs_quality/render_obs_mask.py <modes...>`.
+- **2026-10-08 — Test-run diagnosis (no bug):** runs in `.tmp/runs/obsNoise*`, `obs_50pOcean*` vs `table1_refRun_lr1em2` (same setup).
+  Noise lifts the loss by its own floor (+0.001/+0.005 at scale 0.05/0.1; +0.36 at 1.0, where Adam steps are also diluted by the
+  noise gradient and the per-channel NMSE variance is computed on noisy targets). 50% random-pixel coverage = ref on clean-truth
+  RMSE (assim SSH +6.3 vs +6.4%, V +10.1 vs +10.2%); its lower loss / higher "Improvement" (22.97 vs 22.55%) is only because loss
+  is averaged over a different pixel subset. `Improvement` = 1 − final/initial loss → not comparable across obs settings; use
+  `metrics/rmse_evolution.csv` (always vs clean ground truth).
+- **2026-10-08 — Coverage mode switched to blocks:** `observations.mode=<int>` now splits the full lat/lon domain (land included)
+  into 10×10 = 100 blocks (`MaskBuilder.N_BLOCKS_PER_AXIS`) and observes <int> random blocks, one draw fixed for all time steps,
+  shared by the 5 variables. Real ocean coverage varies with how much land the drawn blocks contain (printed in obs_mask.png titles).
+- **2026-10-08 — Noise sigma made global per variable:** `add_gaussian_noise` now uses one scalar sigma_c per channel
+  (anomaly RMS over window and ocean pixels) instead of a per-pixel map; still i.i.d. per (t, x, y), ocean only.
+  Check: `.tmp/obs_quality/verify_scalar_noise.py`.

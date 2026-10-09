@@ -6,7 +6,6 @@ Provides:
     - ObservationOperator: Apply observation operators (SSH along-track, SST gridded)
 """
 
-import warnings
 import xarray as xr
 import numpy as np
 import torch
@@ -519,10 +518,10 @@ class ObservationOperator:
         """
         Add Gaussian observation noise to the 5 core channels [SSH, T, S, U, V] (feature flag: observations.noise).
 
-        The noise std is per variable and per pixel, set by the temporal anomaly of the observed window:
-            sigma_c(x, y) = noise_scale * sqrt( mean_t[ (x_c(t, x, y) - mean_c(x, y))^2 ] )
-        where mean_c is the yearly mean from data.stats_file. sigma is therefore large where the dynamics
-        depart strongly from the mean (chaotic / high-variance regions) and small in quiet regions.
+        White noise with one std per variable, set by the global anomaly RMS of the observed window:
+            sigma_c = noise_scale * sqrt( mean_{t, ocean x, y}[ (x_c(t, x, y) - mean_c(x, y))^2 ] )
+        where mean_c is the yearly mean from data.stats_file. The same sigma_c is used everywhere in the
+        ocean; the draw is independent for every (t, x, y) and every variable.
 
         Args:
             model_state: Target sequence dataset, data [T, C, H, W] (C >= 5)
@@ -542,15 +541,14 @@ class ObservationOperator:
         # Yearly mean of the same channels on the target grid: [5, H, W]
         mean = self.align_grid(mean_field.isel(ch=slice(0, 5)), model_state).values
 
-        # Per-pixel anomaly RMS over the observation window -> noise std [5, H, W]
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN land pixels -> NaN, zeroed below
-            sigma = noise_scale * np.sqrt(np.nanmean((signal - mean[None]) ** 2, axis=0))
-        sigma = np.nan_to_num(sigma, nan=0.0)  # land / missing mean -> no noise
+        # Global anomaly RMS per channel over time and ocean pixels -> one noise std per variable [5]
+        anomaly = signal - mean[None]
+        valid = np.isfinite(anomaly)  # ocean pixels with a defined mean (land / NaN -> no noise)
+        sigma = noise_scale * np.sqrt(np.nanmean(np.where(valid, anomaly, np.nan) ** 2, axis=(0, 2, 3)))
 
-        # Independent Gaussian draw for every (t, c, x, y), scaled by the local std
+        # Independent Gaussian draw for every (t, c, x, y) with the channel std, ocean pixels only
         rng = np.random.default_rng(seed)
-        noise = rng.standard_normal(signal.shape) * sigma[None]
+        noise = rng.standard_normal(signal.shape) * sigma[None, :, None, None] * valid
 
         model_state["data"][:, 0:5, :, :] = (signal + noise).astype(model_state["data"].dtype)
 

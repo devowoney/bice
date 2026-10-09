@@ -350,3 +350,9 @@ python run_optimization.py observations.mode=simulated  # Override params
 - **Coverage mode:** integer `observations.mode` (0-100 = % of ocean pixels), random per time step, shared across channels (user choice).
 - **Noise before operators, never with `mode: real`** (A7: no synthetic perturbation of real observations). Ground truth stays clean (A2).
 - **Seed = observations.seed + sample_idx** so batch samples get different but reproducible patterns (A5).
+- **2026-10-08 — Noise = white noise with ONE sigma per variable (user).** i.i.d. Gaussian per (t, c, x, y), sigma_c = noise_scale × global
+  anomaly RMS (window × ocean pixels, vs stats_file mean), drawn once per run. Replaces the per-pixel sigma map. The loss still
+  shifts up by ~sigma² (irreducible floor) whatever the sigma shape.
+- **2026-10-08 — Coverage = random 10×10 lat/lon blocks, fixed in time (user).** Replaces random pixels: scattered pixels redrawn
+  daily left only 0.5^7 ≈ 0.8% of pixels never seen at 50%, so coverage barely changed the result. pct% → pct blocks of 100
+  (land blocks count, so ocean coverage ≠ pct exactly).

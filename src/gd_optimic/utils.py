@@ -55,6 +55,8 @@ class MaskBuilder:
     - Apply observation operators only where data exists (obs_mask)
     """
 
+    N_BLOCKS_PER_AXIS = 10  # block coverage mode: 10 x 10 = 100 lat/lon blocks
+
     def __init__(self, device: str = "cuda"):
         """
         Initialize mask builder.
@@ -126,7 +128,7 @@ class MaskBuilder:
                 - 'full': all ocean pixels observed (idealized twin/ceiling check)
                 - 'simulated': realistic observation coverage with GLORYS12 truth (OSSE)
                 - 'real': real satellite observations (OSE)
-                - int 0-100: random coverage, % of ocean pixels observed per time step (all variables)
+                - int 0-100: block coverage, pct of the 10x10 lat/lon blocks observed (fixed in time, all variables)
             seed: int - RNG seed for random coverage mode (A5 reproducibility)
 
         Returns:
@@ -183,18 +185,22 @@ class MaskBuilder:
             obs_mask[:, 2:5, :, :] = 0.0
 
         elif coverage_percent(obs_mode) is not None:
-            # Random coverage: keep exactly round(pct% * N_ocean) ocean pixels per time step,
-            # drawn independently for each time and shared by all 5 variables
+            # Block coverage: split the full lat/lon domain (land included) into a 10x10 grid of
+            # 100 blocks and observe pct randomly chosen blocks (pct% -> pct blocks). One draw,
+            # fixed for all time steps and shared by all 5 variables; land stays unobserved.
             pct = coverage_percent(obs_mode)
             gen = torch.Generator().manual_seed(seed)
-            ocean_idx = (base_ocean_mask[0].flatten() > 0).nonzero().squeeze(1).cpu()  # surface ocean pixels
-            n_keep = round(pct / 100.0 * ocean_idx.numel())
             H, W = obs_mask.shape[-2:]
-            for t in range(obs_length):
-                keep = ocean_idx[torch.randperm(ocean_idx.numel(), generator=gen)[:n_keep]]
-                coverage = torch.zeros(H * W, device=obs_mask.device)
-                coverage[keep.to(obs_mask.device)] = 1.0
-                obs_mask[t] *= coverage.view(1, H, W)  # broadcast over channels
+            lat_edges = np.linspace(0, H, self.N_BLOCKS_PER_AXIS + 1).round().astype(int)
+            lon_edges = np.linspace(0, W, self.N_BLOCKS_PER_AXIS + 1).round().astype(int)
+            n_blocks = self.N_BLOCKS_PER_AXIS ** 2
+            active = torch.randperm(n_blocks, generator=gen)[: round(pct / 100.0 * n_blocks)].tolist()
+
+            coverage = torch.zeros(H, W, device=obs_mask.device)
+            for b in active:
+                i, j = divmod(b, self.N_BLOCKS_PER_AXIS)
+                coverage[lat_edges[i]:lat_edges[i + 1], lon_edges[j]:lon_edges[j + 1]] = 1.0
+            obs_mask *= coverage  # broadcast over time and channels
 
         else:
             raise ValueError(
