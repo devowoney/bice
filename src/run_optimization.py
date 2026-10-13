@@ -38,6 +38,11 @@ from gd_optimic.gradient import ScheduledPooling
 from gd_optimic.output_handler import save_obs_mask_figure
 
 
+# Hydra run/sweep dirs are anchored at the project root, so artifacts land in
+# <project>/.tmp/runs and <project>/.tmp/multiruns whatever the launch directory
+OmegaConf.register_new_resolver("project_root", lambda: str(Path(__file__).resolve().parent.parent), replace=True)
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="optimize_ic")
 def main(cfg: DictConfig):
     """
@@ -196,7 +201,7 @@ def main(cfg: DictConfig):
         seed=obs_seed
     )
     save_obs_mask_figure(
-        obs_mask, ocean_mask, input_sequence, Path(cfg.logging.output_dir) / exp_id / "diagnostics",
+        obs_mask, ocean_mask, input_sequence, Path("diagnostics"),
         title=f"| mode={cfg.observations.mode} | seed={obs_seed}",
     )
     
@@ -343,7 +348,7 @@ def main(cfg: DictConfig):
         learning_rate=cfg.optimization.learning_rate,
         num_iterations=cfg.optimization.num_iterations,
         device=device,
-        output_dir=cfg.logging.output_dir,
+        output_dir="",  # hydra already chdir'd into .tmp/runs/{exp_name}_{timestamp}
         tensorboard_subdir=cfg.logging.tensorboard_subdir,
         checkpoints_subdir=cfg.logging.checkpoints_subdir,
         metrics_subdir=cfg.logging.metrics_subdir,
@@ -372,7 +377,7 @@ def main(cfg: DictConfig):
         x0_init=x0_init,
         target_sequence=target_tensor,
         ocean_mask=ocean_mask,
-        exp_id=exp_id,
+        exp_id="",
         regional_masks=regional_masks,
         input_sequence_xr=input_sequence,
         target_sequence_xr=target_sequence,
@@ -388,7 +393,7 @@ def main(cfg: DictConfig):
     logger.info(f"Improvement: {(1 - results['final_loss'] / results['initial_loss']) * 100:.2f}%")
     logger.info("="*60 + "\n")
     
-    exp_output_dir = Path(cfg.logging.output_dir) / exp_id
+    exp_output_dir = Path.cwd()
     logger.info(f"Results saved to: {exp_output_dir}")
     logger.info(f"\nTo view TensorBoard:")
     logger.info(f"  tensorboard --logdir {exp_output_dir}/{cfg.logging.tensorboard_subdir}")

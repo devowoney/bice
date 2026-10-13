@@ -130,6 +130,11 @@ def setup_reproducibility(seed: int = 42):
         torch.backends.cudnn.benchmark = False
 
 
+# Hydra run/sweep dirs are anchored at the project root, so artifacts land in
+# <project>/.tmp/runs and <project>/.tmp/multiruns whatever the launch directory
+OmegaConf.register_new_resolver("project_root", lambda: str(Path(__file__).resolve().parent.parent), replace=True)
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="optimize_ic")
 def main(cfg: DictConfig):
     """

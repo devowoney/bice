@@ -7,13 +7,17 @@ experiment:
   description: "Initial condition optimization with full observations (idealized twin)"
   timestamp: ${now:%Y-%m-%d_%H-%M-%S}  # Auto-generated at runtime
 
+# Base folder for run artifacts: ${artifacts_root}/runs (single/parallel runs) and
+# ${artifacts_root}/multiruns (hydra sweeps). Override it to put them on a larger disk.
+artifacts_root: ${project_root:}/.tmp
+
 #  Hydra output
   #  Align output directory with main script
 hydra:
   run:
-    dir: .tmp/runs/${experiment.name}_${experiment.timestamp}
+    dir: ${artifacts_root}/runs/${experiment.name}_${experiment.timestamp}
   sweep:
-    dir: .tmp/multiruns/${experiment.name}_${experiment.timestamp}
+    dir: ${artifacts_root}/multiruns/${experiment.name}_${experiment.timestamp}
   job:
     chdir: true 
     name: ${experiment.name} 
