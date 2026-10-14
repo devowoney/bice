@@ -277,7 +277,9 @@ class StructureConsistencyLoss:
             struct_mse_reshaped = struct_mse_all_channels.reshape(B, T, C, 2)
             # Combine x and y gradients: average or RMS combination
             # Using RMS: sqrt(grad_x^2 + grad_y^2) provides physical magnitude
-            struct_mse_combined = torch.sqrt((struct_mse_reshaped ** 2).sum(dim=-1))  # [B, T, C]
+            # clamp: an unobserved channel has exactly 0 here and d sqrt/dx(0) = inf -> NaN gradient;
+            # below the clamp the gradient is 0, observed channels are unchanged
+            struct_mse_combined = torch.sqrt((struct_mse_reshaped ** 2).sum(dim=-1).clamp(min=1e-20))  # [B, T, C]
         else:
             # Laplacian: already per-channel, no reshaping needed
             struct_mse_combined = struct_mse_all_channels  # [B, T, C]

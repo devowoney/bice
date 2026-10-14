@@ -431,3 +431,7 @@
   right after the observation-noise call (`run_optimization.py` now loads the stats mean once for either flag).
   `ic_rmse` keeps measuring drift from the (noisy) starting IC, not distance to the clean truth.
   Check: `.tmp/obs_quality/verify_ic_noise.py`.
+- **2026-10-14 — `observations.variables` added:** `utils.observed_channels()` + `MaskBuilder.build_obs_mask(variables=)`,
+  wired in all 3 entrypoints and configs; `ObservationLoss._compute_dynamic_weights` zeroes unobserved channels;
+  `structural_loss.py` NaN-gradient fix. Check: `.tmp/obs_quality/verify_obs_variables.py` (synthetic, all pass).
+  Not yet run end-to-end.

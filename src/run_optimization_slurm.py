@@ -306,6 +306,7 @@ def main(cfg: DictConfig):
         sst_nanmask=sst_mask,
         obs_mode=cfg.observations.mode,
         seed=obs_seed,
+        variables=cfg.observations.get("variables", None),
     )
     save_obs_mask_figure(
         obs_mask, ocean_mask, input_sequence, Path("diagnostics"),

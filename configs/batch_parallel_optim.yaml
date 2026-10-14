@@ -86,6 +86,9 @@ observations:
   noise_scale: 1.0    # white noise, one std per variable: sigma_c = noise_scale * RMS(x_c - mean_c) over
                       # the observation window and all ocean pixels, mean_c from data.stats_file
   seed: 0             # RNG seed for noise and block coverage (effective seed = seed + sample_idx, A5)
+  variables: [SSH, T, S, U, V]  # Observed variables (subset of SSH, T, S, U, V); unlisted ones are
+                                # unobserved over the whole window (no loss term), on top of 'mode'.
+                                # e.g. [SSH] -> does SSH information propagate to recover T, S, U, V?
   
   # Observation operators follow R2 decisions
   ssh_operator: "nearest_neighbor"  # Along-track → nearest-neighbor interpolation

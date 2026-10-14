@@ -362,3 +362,12 @@ python run_optimization.py observations.mode=simulated  # Override params
   and the saved initial IC are all the noisy background; ground truth stays clean (A2). Allowed with `mode: real` (the IC is
   GLORYS, not a real observation). RNG = `default_rng([seed + sample_idx, 1])`: with a plain int seed equal to the obs seed
   the IC draw would copy the first 2 steps of the obs-noise draw (correlated errors).
+- **2026-10-14 — Variable observability `observations.variables` (user).** List of observed variables (subset of
+  SSH, T, S, U, V; default all). Unlisted variables are zeroed in obs_mask for the whole window, on top of `mode`
+  (coverage/simulated), so they never enter J_obs or J_struct; RMSE vs clean ground truth still covers all 5 → tests
+  whether information from the observed variables propagates (through the model) to recover the others.
+  Dynamic weights of unobserved channels set to 0 (was 1/1e-10 ≈ 1e10: harmless to the loss, garbage in logs).
+  Manual weights are NOT renormalized (SSH-only with equal weights → loss = 0.2 × SSH NMSE; Adam is scale-invariant).
+- **2026-10-14 — Bug fix: NaN gradient in J_struct for unobserved channels.** `structural_loss.py` sqrt(mse_x² + mse_y²)
+  at exactly 0 → inf × 0 = NaN. Pre-existing for `mode: simulated` (S/U/V unobserved) with `use_structural_loss: true`.
+  Fixed with clamp(min=1e-20) before sqrt (zero gradient below, observed channels unchanged).

@@ -230,11 +230,12 @@ class ObservationLoss:
         
         return weighted_loss, weights
 
-    @staticmethod
-    def _compute_dynamic_weights(loss_per_var: torch.Tensor) -> torch.Tensor:
-        """Compute inverse-magnitude weights from per-variable loss values."""
+    def _compute_dynamic_weights(self, loss_per_var: torch.Tensor) -> torch.Tensor:
+        """Compute inverse-magnitude weights from per-variable loss values (0 for unobserved channels)."""
         loss_mag = loss_per_var.detach().abs() + 1e-10
-        return loss_mag.sum(dim=1, keepdim=True) / loss_mag
+        # Channels with no observation have loss 0 -> 1/1e-10 weight; zero it (loss value unchanged)
+        observed = (self.obs_mask.sum(dim=(0, 2, 3)) > 0).to(loss_mag.dtype).view(1, -1)
+        return loss_mag.sum(dim=1, keepdim=True) / loss_mag * observed
     
     def compute_per_variable_loss(
         self,

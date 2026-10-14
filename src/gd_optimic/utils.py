@@ -10,7 +10,7 @@ Provides:
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +35,28 @@ def coverage_percent(obs_mode):
     if not 0 <= obs_mode <= 100:
         raise ValueError(f"observations.mode coverage must be in [0, 100], got {obs_mode}")
     return obs_mode
+
+
+OBS_VARIABLES = ["SSH", "T", "S", "U", "V"]  # channel order of the 5 core variables
+
+
+def observed_channels(variables) -> list:
+    """
+    Parse observations.variables (names of the observed variables) into channel indices.
+
+    Args:
+        variables: list of names from OBS_VARIABLES (case-insensitive), or None for all 5
+
+    Returns:
+        Sorted list of observed channel indices, e.g. ["SSH"] -> [0]
+    """
+    if variables is None:
+        return list(range(len(OBS_VARIABLES)))
+    names = [str(v).upper() for v in variables]
+    unknown = [v for v in names if v not in OBS_VARIABLES]
+    if unknown:
+        raise ValueError(f"observations.variables: unknown {unknown}, choose from {OBS_VARIABLES}")
+    return sorted(OBS_VARIABLES.index(v) for v in set(names))
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +137,7 @@ class MaskBuilder:
         sst_nanmask: np.ndarray = None,
         obs_mode: str = "full",
         seed: int = 0,
+        variables: Optional[List[str]] = None,
     ) -> torch.Tensor:
         """
         Create observation mask indicating where observations are available.
@@ -130,6 +153,8 @@ class MaskBuilder:
                 - 'real': real satellite observations (OSE)
                 - int 0-100: block coverage, pct of the 10x10 lat/lon blocks observed (fixed in time, all variables)
             seed: int - RNG seed for random coverage mode (A5 reproducibility)
+            variables: list of observed variable names (subset of OBS_VARIABLES), None = all.
+                       Unlisted variables are unobserved over the whole window, on top of obs_mode.
 
         Returns:
             obs_mask: torch.Tensor [T, C, H, W] - observation mask
@@ -206,6 +231,10 @@ class MaskBuilder:
             raise ValueError(
                 f"Unknown obs_mode: {obs_mode}. Must be 'full', 'simulated', 'real' or an integer 0-100"
             )
+
+        # Variable observability: unlisted variables never enter the loss (all time steps, all pixels)
+        unobserved = [c for c in range(5) if c not in observed_channels(variables)]
+        obs_mask[:, unobserved, :, :] = 0.0
 
         return obs_mask
 
