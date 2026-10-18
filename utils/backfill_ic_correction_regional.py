@@ -2,7 +2,8 @@
 """
 Backfill regional zooms of the IC correction figure on finished runs from their saved states
 (no re-optimization). diagnostics/ic_correction_anomaly_comparison.png is global, where
-grid-scale pixelization is invisible; this re-draws it over western boundary current boxes.
+grid-scale pixelization is invisible; this re-draws it over western boundary current boxes
+and the equatorial Pacific.
 
 Columns: initial anomaly | optimized anomaly | correction (optimized - initial).
 Anomaly = field - time mean of states/ground_truth.nc (same mean_field as the live run).
@@ -35,9 +36,11 @@ import xarray as xr  # noqa: E402
 VAR_META = [("SSH", "Sea Surface Height", "m"), ("T", "Temperature", "°C"), ("S", "Salinity", "PSU"),
             ("U", "Zonal Velocity", "m/s"), ("V", "Meridional Velocity", "m/s")]
 VAR_NAMES = [v for v, _, _ in VAR_META]
-# (lat_min, lat_max, lon_min, lon_max), same boxes as aggregate_all_v3.py / statistics_biceOutput_v2.py
-REGIONS = {"gulf_stream": (30, 45, -85, -30), "kuroshio": (25, 45, 130, 180), "agulhas": (-35, -20, 20, 60)}
-REGION_TITLES = {"gulf_stream": "Gulf Stream", "kuroshio": "Kuroshio", "agulhas": "Agulhas"}
+# (lat_min, lat_max, lon_min, lon_max); WBC boxes as in aggregate_all_v3.py / statistics_biceOutput_v2.py
+REGIONS = {"gulf_stream": (30, 45, -85, -30), "kuroshio": (25, 45, 130, 180), "agulhas": (-35, -20, 20, 60),
+           "equatorial": (-10, 10, -160, -110)}  # equatorial Pacific: f -> 0, strongest checkerboard
+REGION_TITLES = {"gulf_stream": "Gulf Stream", "kuroshio": "Kuroshio", "agulhas": "Agulhas",
+                 "equatorial": "Equatorial Pacific"}
 
 
 def crop(ds, box):
