@@ -4,6 +4,8 @@ IC optimizer selection (feature flag: optimization.use_ic_optimizer).
 Provides:
     - SUPPORTED_IC_OPTIMIZERS: names accepted in optimization.ic_optimizer.name
     - build_ic_optimizer: torch.optim optimizer acting on the IC tensor
+    - ReferenceStep: the outer step f(ψ^k) (GD or torch.optim) computed without moving
+      the IC, followed by the meta-learner in Δ inner-loss mode
 
 When the flag is off, ICOptimizer keeps its constant-step update
 x <- x - learning_rate * masked_gradient. When it is on, the same masked
@@ -82,3 +84,84 @@ def build_ic_optimizer(
     optimizer = optimizer_cls([x0], lr=lr, **kwargs)
     logger.info(f"IC optimizer: {optimizer_cls.__name__}(lr={lr}, {kwargs})")
     return optimizer
+
+
+class ReferenceStep:
+    """
+    The outer update rule f of  ψ^{k+1} = ψ^k − f(ψ^k), as a stand-alone callable.
+
+    In plain words: this computes "the step the baseline optimizer would take from ψ^k
+    with gradient g^k" WITHOUT moving ψ^k. The meta-learner (Δ inner-loss mode) uses it
+    as the reference S has to follow, so S is compared fairly with whatever baseline
+    is configured:
+        - ic_optimizer_config is None  -> plain GD:   f = learning_rate · g
+        - otherwise (adagrad, adam...) -> f = the torch.optim step on g, with its own
+                                          state (Adagrad's Σg², Adam's moments...)
+
+    Call it exactly once per outer gradient: the optimizer state then evolves exactly
+    as in the baseline run (for Adagrad: G += g² once per outer iteration).
+
+    How it works for torch optimizers: the optimizer owns a private "shadow" copy of the
+    IC. Each call copies ψ^k into it, takes one optimizer step with g as its gradient,
+    and reads the step back as f = ψ^k − shadow. The real IC is never touched. (Copying
+    ψ^k in first keeps weight_decay exact, since it depends on the parameter value.)
+    """
+
+    def __init__(
+        self,
+        x_like: torch.Tensor,
+        ic_optimizer_config: Optional[Dict],
+        learning_rate: float,
+    ):
+        """
+        Args:
+            x_like: IC tensor [B, T, C, H, W] (only its shape/dtype/device are used)
+            ic_optimizer_config: optimization.ic_optimizer dict, or None for plain GD
+            learning_rate: optimization.learning_rate (GD step, and default lr of the optimizer)
+        """
+        self.learning_rate = float(learning_rate)
+        self.optimizer = None
+        self._shadow = None
+        if ic_optimizer_config is not None:
+            # Private leaf tensor the optimizer updates in place (its state is keyed on it)
+            self._shadow = x_like.detach().clone().requires_grad_(True)
+            self.optimizer = build_ic_optimizer(self._shadow, ic_optimizer_config, self.learning_rate)
+
+    def describe(self) -> str:
+        """Short name for logs, e.g. 'GD(lr=0.01)' or 'Adagrad(lr=0.1)'."""
+        if self.optimizer is None:
+            return f"GD(lr={self.learning_rate})"
+        lr = self.optimizer.param_groups[0]["lr"]
+        return f"{type(self.optimizer).__name__}(lr={lr})"
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        x: torch.Tensor,
+        gradient: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Return f(ψ^k) for the current IC x = ψ^k and its (masked) gradient g^k.
+
+        Args:
+            x: current IC ψ^k [B, T, C, H, W]
+            gradient: masked outer gradient g^k, same shape
+            mask: optional ocean mask broadcastable to x; the step is re-masked so land
+                  points never move (same as the baseline IC-optimizer branch)
+
+        Returns:
+            f: step in IC units, so that the reference update is ψ^{k+1} = ψ^k − f
+        """
+        if self.optimizer is None:
+            step = self.learning_rate * gradient
+        else:
+            x = x.detach()
+            self._shadow.copy_(x)
+            self._shadow.grad = gradient.detach().clone()
+            self.optimizer.step()
+            step = x - self._shadow
+            self._shadow.grad = None
+        if mask is not None:
+            step = step * mask
+        return step.detach()
