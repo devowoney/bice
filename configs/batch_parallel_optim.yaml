@@ -177,8 +177,9 @@ optimization:
   # (x <- x - learning_rate * masked_gradient), identical to previous behavior.
   # true = feed the same masked gradient to a torch.optim optimizer.
   # Meta-learner: with use_meta_learner + delta_inner_loss, this same rule is the reference
-  # step f (psi^{k+1} = psi^k - f(psi^k)) that S learns to follow, so S is compared fairly
-  # with the matching baseline (e.g. adagrad). Ignored by the other meta-learner modes.
+  # step f (psi^{k+1} = psi^k - f(psi^k)): S sees the gradient and the same rule is applied
+  # to S's output, so S is compared fairly with the matching baseline (e.g. adagrad).
+  # Ignored by the other meta-learner modes.
   use_ic_optimizer: false
 
   ic_optimizer:

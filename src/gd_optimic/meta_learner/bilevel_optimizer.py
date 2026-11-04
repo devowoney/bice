@@ -201,14 +201,14 @@ class BiLevelICOptimizer:
 
         # Δ inner loss (child of hybrid_input)
         # ------------------------------------
-        # In plain words: the network S learns to propose an IC step that looks like the
-        # outer loop's step f in ψ^{k+1} = ψ^k − f(ψ^k) -- plain gradient descent
-        # (learning_rate × gradient) or an adaptive rule such as Adagrad when
-        # use_ic_optimizer is on -- and we apply it K times per outer iteration instead of
+        # In plain words: the network S looks at the gradient and proposes a "learned
+        # gradient" ĝ. The outer optimizer's rule is applied to it -- plain gradient descent
+        # (learning_rate × ĝ) or an adaptive rule such as Adagrad when use_ic_optimizer is on
+        # (see outer_rule_factor) -- and we apply this K times per outer iteration instead of
         # calling the expensive forward model K times.
         #
         # S is trained with two signals, neither of which runs GloNet inside the meta loop:
-        #   - l_align: "point in f's direction" (1 − cosine; says nothing about length).
+        #   - l_align: "point in the gradient's direction" (1 − cosine; says nothing about length).
         #   - l_perf:  "did the last move actually reduce the cost?" It reuses the gradient
         #              the outer loop computes at the new IC anyway, and backpropagates it
         #              through S only: dJ(ψ^k)/dθ = −∇J(ψ^k)ᵀ ∂(ψ^{k-1} − ψ^k)/∂θ.
@@ -334,7 +334,7 @@ class BiLevelICOptimizer:
                 - Explicitly detached to avoid OOM during meta-optimization
                 - Represents the direction that reduces loss via gradient descent
             iteration: Current outer loop iteration (for TensorBoard logging)
-            ref_step: [B, T, C, H, W] reference outer step f(ψ^k) that S learns to follow
+            ref_step: [B, T, C, H, W] outer step f(ψ^k), whose rule is applied to S's output
                 (delta_inner_loss only). It is the step of the configured outer update rule
                 (plain GD: learning_rate·∇, or Adagrad/Adam/... when use_ic_optimizer is on).
                 None = plain GD, f = outer_lr·∇.
@@ -767,6 +767,8 @@ class BiLevelICOptimizer:
         gradient_mean: torch.Tensor,
         gradient_std: torch.Tensor,
         iteration: int,
+        outer_factor: Optional[torch.Tensor] = None,
+        outer_cap: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Predict the IC update in meta_one_task mode (gradient-only or hybrid input).
@@ -776,24 +778,24 @@ class BiLevelICOptimizer:
 
         Args:
             x: [B, T, C, H, W] current IC state (only used when hybrid_input=True)
-            gradient: [B, T, C, H, W] outer-loop gradient ∇_x J.
-                With delta_inner_loss this is instead the REFERENCE STEP f(ψ^k) of the outer
-                update rule (η·∇J for plain GD, the Adagrad/Adam/... step otherwise): S sees
-                it as input and learns to follow it.
-            gradient_mean: Per-channel mean of `gradient` (of f with delta_inner_loss)
-            gradient_std: Per-channel std of `gradient` (of f with delta_inner_loss)
+            gradient: [B, T, C, H, W] outer-loop gradient ∇_x J
+            gradient_mean: Per-channel gradient mean
+            gradient_std: Per-channel gradient std
             iteration: Outer-loop iteration k
+            outer_factor, outer_cap: delta_inner_loss only, from outer_rule_factor():
+                the per-pixel factor P of the outer rule (f = P ⊙ ∇J) and the per-channel
+                cap on each pixel's move
 
         Returns:
             ic_update: [B, T, C, H, W] update in gradient space (x_new = x - ic_update);
-                with delta_inner_loss, the physical step Δ̂ ≈ f(ψ^k)
+                with delta_inner_loss, the physical step P ⊙ ĝ (≈ f(ψ^k) if S copies ∇J)
             ic_update_standardized: [B, T, C, H, W] raw network output s (standardized, bounded by output_scale)
             gradient_standardized: [B, T, C, H, W] standardized gradient
         """
         if self.delta_inner_loss:
-            # Here `gradient` is the reference step f. Divide by its per-channel std only,
-            # without subtracting the mean, so a zero step stays zero (land and flat regions
-            # get no update). l_align compares the direction of S's output with this field.
+            # S always sees the gradient ∇J, whatever the outer optimizer is. Divide by the
+            # per-channel std only, without subtracting the mean, so a zero gradient stays zero
+            # (land and flat regions get no update). l_align compares S's output with this field.
             gradient_standardized = gradient / self._broadcast_channels(gradient_std, gradient)
         else:
             gradient_standardized = (
@@ -811,14 +813,19 @@ class BiLevelICOptimizer:
         ic_update_standardized = self.predict_update(x_in, iteration=iteration)
 
         if self.delta_inner_loss:
-            # Turn the network output back into a physical IC step:
-            #   s     -> step in "reference-step std" units (≈ f/σ_f if S imitates f),
-            #            bounded per pixel by ±output_scale through the final tanh
-            #   × σ_f -> step in IC units, comparable to one reference step f
-            # So output_scale is a safety cap measured in σ_f: with output_scale ≈ 5 S can
-            # take steps up to 5× the reference step's spread per pixel, but not explode.
-            # (Plain GD: f = η·∇J, so σ_f = η·σ_∇ and this is the former s·η·σ_∇.)
-            ic_update = ic_update_standardized * self._broadcast_channels(gradient_std, gradient)
+            # Turn the network output into a physical IC step, in two stages:
+            #   1. learned gradient  ĝ = s · σ_∇   (s ≈ ∇J/σ_∇ if S copies the gradient;
+            #                                       |s| ≤ output_scale through the final tanh)
+            #   2. outer rule        Δ = P ⊙ ĝ     (the optimizer's own per-pixel factor,
+            #                                       so ĝ = ∇J gives exactly Δ = f)
+            # Plain GD: P = η, so Δ = s·η·σ_∇ (the original GD-mode step).
+            learned_gradient = ic_update_standardized * self._broadcast_channels(gradient_std, gradient)
+            ic_update = outer_factor * learned_gradient
+            # Safety cap per pixel: ±output_scale·σ_f. Where |∇J| is tiny P can be huge
+            # (Adagrad's first step: P = lr/|∇J|), and S's small errors there would be blown up.
+            # With plain GD the cap equals the tanh bound above, so it is never active.
+            cap = self._broadcast_channels(outer_cap, ic_update)
+            ic_update = torch.maximum(torch.minimum(ic_update, cap), -cap)
             return ic_update, ic_update_standardized, gradient_standardized
 
         # Destandardize using gradient statistics
@@ -834,12 +841,13 @@ class BiLevelICOptimizer:
         gradient_mean: torch.Tensor,
         gradient_std: torch.Tensor,
         iteration: int,
+        outer_factor: torch.Tensor,
+        outer_cap: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Move the IC K times with the network S, keeping the outer reference step fixed:
-        ψ_{m+1} = ψ_m − Δ̂_θ(ψ_m, f(ψ^k), k). Returns the final IC ψ_K.
-        (`gradient`, `gradient_mean`, `gradient_std` are the reference step f and its
-        per-channel stats, see one_task_update.)
+        Move the IC K times with the network S, keeping the outer gradient fixed:
+        ψ_{m+1} = ψ_m − P ⊙ ĝ_θ(ψ_m, ∇J(ψ^k), k). Returns the final IC ψ_K.
+        (outer_factor P and outer_cap come from outer_rule_factor(), see one_task_update.)
 
         This replaces the "K inner steps" of the original meta loop: the gradient is
         computed once by the outer loop, and S proposes K successive moves from it.
@@ -854,16 +862,48 @@ class BiLevelICOptimizer:
             if use_ckpt:
                 ic_update = checkpoint(
                     self._chain_update, x, gradient, gradient_mean, gradient_std, iteration,
+                    outer_factor, outer_cap,
                     use_reentrant=False,
                 )
             else:
-                ic_update = self._chain_update(x, gradient, gradient_mean, gradient_std, iteration)
+                ic_update = self._chain_update(
+                    x, gradient, gradient_mean, gradient_std, iteration, outer_factor, outer_cap
+                )
             x = x - ic_update
         return x
 
-    def _chain_update(self, x, gradient, gradient_mean, gradient_std, iteration):
+    def _chain_update(self, x, gradient, gradient_mean, gradient_std, iteration, outer_factor, outer_cap):
         # One application of S, returning only the IC step (wrapper for checkpoint())
-        return self.one_task_update(x, gradient, gradient_mean, gradient_std, iteration)[0]
+        return self.one_task_update(
+            x, gradient, gradient_mean, gradient_std, iteration, outer_factor, outer_cap
+        )[0]
+
+    def outer_rule_factor(
+        self, ref_step: torch.Tensor, gradient: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Write the outer step as a per-pixel factor times the gradient: f = P ⊙ ∇J.
+
+        In plain words: P says how the outer optimizer turns a gradient into a step at each
+        pixel. S proposes a "learned gradient" ĝ, and the move is P ⊙ ĝ, i.e. the outer rule
+        applied to S's output. P is read off the step itself (P = f / ∇J), so this works for
+        any optimizer without knowing its internals:
+            plain GD:  P = η                      (the same everywhere)
+            Adagrad:   P = lr / (√G + eps)        (G = running sum of ∇J²)
+            Adam, ...: momentum and scaling folded into P
+        Pixels with ∇J = 0 (land) get P = 0: no evidence, no move.
+
+        Returns:
+            P:   [B, T, C, H, W] per-pixel factor
+            cap: [C] per-channel bound on each pixel's move, output_scale · σ_f
+                 (the same bound S's step had before; see one_task_update)
+        """
+        nonzero = gradient != 0
+        P = torch.where(nonzero, ref_step / torch.where(nonzero, gradient, torch.ones_like(gradient)),
+                        torch.zeros_like(gradient))
+        _, ref_std = self._get_gradient_statistics(ref_step, min_std=torch.finfo(ref_step.dtype).tiny)
+        cap = self.network_s.output_scale * ref_std
+        return P.detach(), cap.detach()
 
     def _delta_inner_step(
         self,
@@ -876,15 +916,16 @@ class BiLevelICOptimizer:
         One outer iteration of the Δ inner-loss mode.
 
         The outer loop is ψ^{k+1} = ψ^k − f(ψ^k), where f is the configured update rule
-        (plain GD: f = η·∇J; or Adagrad/Adam/... when use_ic_optimizer is on). S learns
-        to follow f, whatever it is: ref_step = f(ψ^k) is computed by the outer loop
-        (None = plain GD, η·∇J). The true gradient ∇J(ψ^k) is still used to judge moves
-        (l_perf, ρ).
+        (plain GD: f = η·∇J; or Adagrad/Adam/... when use_ic_optimizer is on);
+        ref_step = f(ψ^k) is computed by the outer loop (None = plain GD, η·∇J).
+        S always works on the gradient: it sees ∇J and proposes a "learned gradient" ĝ.
+        The outer rule is then applied to S's output, Δ = P ⊙ ĝ with f = P ⊙ ∇J
+        (see outer_rule_factor), so if S copies ∇J the move is exactly f.
 
         In plain words:
           1. Train S for num_meta_steps steps, in three phases (as in the original loop):
              - ALIGN (first grad_align_steps steps): only ask S to point in the gradient's
-               direction of the reference step f (l_align);
+               direction (l_align);
              - TRANS (next grad_trans_steps steps): both l_align and l_perf;
              - PERF (remaining steps): only ask whether S's previous K-step move really
                reduced the cost (l_perf, weighted by w_perf_delta). This sets the step size.
@@ -898,7 +939,7 @@ class BiLevelICOptimizer:
             w_align·l_align + w_perf_delta·l_perf + l_reg    (TRANS)
             w_perf_delta·l_perf + l_reg                      (PERF)
         where
-            l_align = 1 − cos(one application of S, f(ψ^k)) over ocean points (direction only)
+            l_align = 1 − cos(S's output s, ∇J(ψ^k)/σ_∇) over ocean points (direction only)
             l_perf  = −⟨∇J(ψ^k), ψ^{k-1} − ψ_K(θ)⟩ / (K·⟨∇J(ψ^{k-1}), f(ψ^{k-1})⟩)
         ψ_K(θ) replays the previous K-step chain from ψ^{k-1} with the current θ. The value is
         a first-order model of the cost after that move; its θ-gradient is exactly dJ(ψ^k)/dθ
@@ -912,15 +953,17 @@ class BiLevelICOptimizer:
         No forward model call happens inside the meta-steps.
         """
         gradient = gradient.to(self.device).detach()
-        # Reference step f(ψ^k) that S follows (default: plain GD, f = η·∇J)
+        # Outer step f(ψ^k) (default: plain GD, f = η·∇J)
         if ref_step is None:
             ref_step = self.outer_lr * gradient
         ref_step = ref_step.to(self.device).detach()
-        # Per-channel stats of f: S's input/target are f/σ_f and its output is mapped back
-        # to IC units with σ_f (see one_task_update). Tiny floor: f can be much smaller than eps.
-        ref_mean, ref_std = self._get_gradient_statistics(
-            ref_step, min_std=torch.finfo(ref_step.dtype).tiny
+        # Per-channel stats of the gradient: S's input/target are ∇J/σ_∇ and its output is
+        # mapped back to a learned gradient with σ_∇ (see one_task_update).
+        g_mean, g_std = self._get_gradient_statistics(
+            gradient, min_std=torch.finfo(gradient.dtype).tiny
         )
+        # The outer rule as a per-pixel factor (f = P ⊙ ∇J), applied to S's output
+        P, cap = self.outer_rule_factor(ref_step, gradient)
         self.network_s.train()
 
         x_det = x_current.detach()  # current IC ψ^k (fixed data for S's training)
@@ -928,7 +971,7 @@ class BiLevelICOptimizer:
         n_params = sum(p.numel() for p in params)
         prev = self._chain_prev  # previous iteration's move, None at the first iteration
 
-        last_l_align = last_l_perf = last_l_reg = last_cosine_sim = grad_norm = 0.0
+        last_l_align = last_l_perf = last_l_reg = last_cosine_sim = last_cap_fraction = grad_norm = 0.0
         last_rho = None
         if prev is not None:
             # Diagnostics on the move that was actually applied last iteration (independent of
@@ -959,20 +1002,19 @@ class BiLevelICOptimizer:
             else:
                 phase_name = "PERF"
 
-            # --- l_align: "point in the same direction as the reference step f" ---
-            # Apply S once at the current IC and compare the DIRECTION of its step with f:
-            # l_align = 1 − cos(S's step, f(ψ^k)), over ocean points, in σ_f units
-            # (0 = same direction, 1 = orthogonal). For plain GD, f ∝ ∇J. It does not care
-            # about the step's length: the step size is left to l_perf, so S is not pulled
-            # back to the size of one reference step (output_scale still caps each pixel at
-            # output_scale·σ_f).
-            ic_update, ic_update_standardized, ref_standardized = self.one_task_update(
-                x_det, ref_step, ref_mean, ref_std, iteration
+            # --- l_align: "point in the same direction as the gradient" ---
+            # Apply S once at the current IC and compare the DIRECTION of its output with the
+            # gradient: l_align = 1 − cos(s, ∇J(ψ^k)/σ_∇), over ocean points
+            # (0 = same direction, 1 = orthogonal). This target is the same for every outer
+            # optimizer: the optimizer only acts afterwards, on S's output (P ⊙ ĝ). It does not
+            # care about the length: the step size is left to l_perf.
+            ic_update, ic_update_standardized, gradient_standardized = self.one_task_update(
+                x_det, gradient, g_mean, g_std, iteration, P, cap
             )
             align_mask = self._ocean_mask_like(ic_update_standardized).expand_as(ic_update_standardized)
             l_align = 1.0 - torch.nn.functional.cosine_similarity(
                 (ic_update_standardized * align_mask).flatten(start_dim=1),
-                (ref_standardized * align_mask).flatten(start_dim=1),
+                (gradient_standardized * align_mask).flatten(start_dim=1),
                 dim=-1,
             ).mean()
             l_reg = self.lambda_reg * (self.lambda_reg * sum((p ** 2).sum() for p in params) / n_params)
@@ -981,20 +1023,26 @@ class BiLevelICOptimizer:
                 l_meta = l_meta + self.w_align * l_align
             # (In PERF, l_align is still computed, but only logged.)
 
-            # cos(S's step, f) per channel, averaged (logged as cos(S,f))
+            # cos(S's step, f) per channel, averaged (logged as cos(S,f)): 1 = S's move after
+            # the outer rule points like the optimizer's own step
             last_cosine_sim = torch.nn.functional.cosine_similarity(
                 ic_update.detach().flatten(start_dim=2), ref_step.flatten(start_dim=2), dim=-1
             ).mean().item()
+            # Share of ocean pixels where the safety cap clipped the move (0 = cap inactive)
+            with torch.no_grad():
+                at_cap = ic_update.abs() >= self._broadcast_channels(cap, ic_update)
+                last_cap_fraction = float(((at_cap & (align_mask > 0)).sum() / align_mask.sum().clamp_min(1)).item())
 
             # --- l_perf: "did the previous move reduce the cost?" (TRANS and PERF) ---
             l_perf = None
             if phase_name in ("TRANS", "PERF"):
-                # Replay last iteration's K-step move from the same starting IC (and the same
-                # reference step f(ψ^{k-1})) with the current θ, tracking gradients through S.
-                # (If θ has not changed yet this iteration, this rebuilds exactly the move
-                # that produced ψ^k.)
+                # Replay last iteration's K-step move from the same starting IC, with the same
+                # gradient and outer rule (P of iteration k-1), with the current θ, tracking
+                # gradients through S. (If θ has not changed yet this iteration, this rebuilds
+                # exactly the move that produced ψ^k.)
                 total_step = prev["x"] - self.delta_chain(
-                    prev["x"], prev["ref_step"], prev["ref_mean"], prev["ref_std"], prev["iteration"]
+                    prev["x"], prev["gradient"], prev["g_mean"], prev["g_std"], prev["iteration"],
+                    prev["P"], prev["cap"],
                 )
                 # Inner product of the gradient at the new IC with the move: a first-order
                 # model of the cost after the move. Minimizing it makes S's moves reduce the
@@ -1041,13 +1089,13 @@ class BiLevelICOptimizer:
                 self.writer.add_scalar("meta_steps/cosine_similarity", last_cosine_sim, global_step)
                 self.writer.add_scalar("meta_steps/phase", {"ALIGN": 0, "TRANS": 1, "PERF": 2}[phase_name], global_step)
 
-            del ic_update, ic_update_standardized, ref_standardized, l_align, l_reg, l_meta, l_perf
+            del ic_update, ic_update_standardized, gradient_standardized, l_align, l_reg, l_meta, l_perf
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         # --- Move the IC: K applications of the trained S, then report the new cost ---
         with torch.no_grad():
-            final_x = self.delta_chain(x_det, ref_step, ref_mean, ref_std, iteration).detach()
+            final_x = self.delta_chain(x_det, gradient, g_mean, g_std, iteration, P, cap).detach()
             step_total = x_det - final_x
             # Diagnostics: size of the move relative to K reference steps, |step|/(K·|f|)
             # (1 = same size; logged under the historical tag meta/step_ratio_vs_K_gd),
@@ -1070,11 +1118,12 @@ class BiLevelICOptimizer:
         # computed from the move actually applied (step_total).
         self._chain_prev = {
             "x": x_det,                    # ψ^k, start of the move
-            "ref_step": ref_step,          # f(ψ^k) and its stats: S's input during the move
-            "ref_mean": ref_mean,
-            "ref_std": ref_std,
+            "gradient": gradient,          # ∇J(ψ^k) and its stats: S's input (and ρ)
+            "g_mean": g_mean,
+            "g_std": g_std,
+            "P": P,                        # outer rule of this iteration, f = P ⊙ ∇J
+            "cap": cap,
             "iteration": iteration,
-            "gradient": gradient,          # ∇J(ψ^k), for ρ
             "step": step_total,            # the move actually applied, ψ^k − ψ^{k+1}
             # l_perf denominator: predicted decrease of K reference steps, K·⟨∇J, f⟩
             "perf_denom": (self.delta_inner_k * (gradient * ref_step).sum()).clamp_min(
@@ -1086,13 +1135,15 @@ class BiLevelICOptimizer:
             self.writer.add_scalar("meta/L_perf", last_l_perf, iteration + 1)
             self.writer.add_scalar("meta/step_ratio_vs_K_gd", step_ratio, iteration + 1)
             self.writer.add_scalar("meta/step_cosine", step_cosine, iteration + 1)
+            self.writer.add_scalar("meta/cap_fraction", last_cap_fraction, iteration + 1)
             if last_rho is not None:
                 self.writer.add_scalar("meta/rho", last_rho, iteration + 1)
 
         logger.info(
             f"Δ inner loss (K={self.delta_inner_k}): L_align={last_l_align:.6f}, "
             f"L_perf={last_l_perf:.6f}, L_reg={last_l_reg:.3e}, cos(S,f)={last_cosine_sim:.4f}, "
-            f"|step|/(K|f|)={step_ratio:.3f}, cos(step,∇)={step_cosine:.4f}, rho={last_rho}"
+            f"|step|/(K|f|)={step_ratio:.3f}, cos(step,∇)={step_cosine:.4f}, rho={last_rho}, "
+            f"cap_fraction={last_cap_fraction:.4f}"
         )
 
         return {

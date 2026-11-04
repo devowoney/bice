@@ -180,15 +180,15 @@ class ICOptimizer:
         self.ic_optimizer_config = ic_optimizer_config or {}
         self.ic_optimizer = None
         # Reference step f for the meta-learner (Δ inner-loss mode), built in optimize():
-        # S learns to follow the same outer rule ψ^{k+1} = ψ^k − f(ψ^k) as the baseline
-        # (plain GD, or the ic_optimizer when use_ic_optimizer is on).
+        # the same outer rule ψ^{k+1} = ψ^k − f(ψ^k) as the baseline (plain GD, or the
+        # ic_optimizer when use_ic_optimizer is on) is applied to S's output.
         self.ref_step_fn = None
         if self.use_ic_optimizer:
             if self.use_meta_learner:
                 if self.meta_learner_config.get("delta_inner_loss", False):
                     logger.info(
                         f"IC optimizer '{self.ic_optimizer_config.get('name', 'adam')}' defines the "
-                        f"reference step f followed by the meta-learner (delta_inner_loss)"
+                        f"outer rule applied to the meta-learner's output (delta_inner_loss)"
                     )
                 else:
                     logger.warning(
@@ -607,14 +607,15 @@ class ICOptimizer:
                     x_inner = x_outer_before
                     if self.meta_learner.delta_inner_loss:
                         # Same move as in training: apply the frozen S delta_inner_k times
-                        # from the current IC, with this iteration's reference step
-                        # f(ψ^k) (GD or Adagrad/...) held fixed
+                        # from the current IC, with this iteration's gradient held fixed and
+                        # the outer rule (GD or Adagrad/...) applied to S's output
                         ref_step = self.ref_step_fn(x_outer_before, masked_gradients, ocean_mask_5d)
-                        ref_mean, ref_std = self.meta_learner._get_gradient_statistics(
-                            ref_step, min_std=torch.finfo(ref_step.dtype).tiny
+                        g_mean, g_std = self.meta_learner._get_gradient_statistics(
+                            masked_gradients, min_std=torch.finfo(masked_gradients.dtype).tiny
                         )
+                        P, cap = self.meta_learner.outer_rule_factor(ref_step, masked_gradients)
                         x_inner = self.meta_learner.delta_chain(
-                            x_inner, ref_step, ref_mean, ref_std, iteration
+                            x_inner, masked_gradients, g_mean, g_std, iteration, P, cap
                         )
                     else:
                         gradient_mean, gradient_std = self.meta_learner._get_gradient_statistics(masked_gradients)
@@ -629,7 +630,7 @@ class ICOptimizer:
                 # Train the meta-learner from the current outer-loop state.
                 self.meta_learner.target_sequence = target_sequence
                 x_outer_before = x0_current.detach()
-                # Δ mode: reference step f(ψ^k) that S learns to follow (computed once per
+                # Δ mode: outer step f(ψ^k), whose rule is applied to S's output (computed once per
                 # outer gradient so an adaptive rule's state evolves as in the baseline)
                 ref_step = None
                 if self.ref_step_fn is not None:
