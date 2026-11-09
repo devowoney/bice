@@ -138,19 +138,19 @@ optimization:
     meta_one_task: true
     meta_general_training: false
     hybrid_input: true   # NEW: Hybrid mode - combine IC + gradient + iteration
-    delta_inner_loss: false  # Child flag of hybrid_input: S sees ∇ and proposes a learned gradient ĝ;
-                             # the outer rule is applied to it (learning_rate·ĝ, or the ic_optimizer rule if
-                             # use_ic_optimizer: true) and the resulting step is applied
-                             # delta_inner_k times per outer gradient. Meta-steps follow ALIGN -> TRANS -> PERF
+    delta_inner_loss: false  # Child flag of hybrid_input: S sees ∇ and stretches the outer step f
+                             # (learning_rate·∇, or the ic_optimizer step if use_ic_optimizer: true) pixel by
+                             # pixel: each of the delta_inner_k applications per outer gradient moves the IC by
+                             # (f/K)·max(1+s, 0), so s = 0 gives exactly one outer step. Meta-steps follow ALIGN -> TRANS -> PERF
                              # (grad_align_steps, grad_trans_steps): ALIGN = w_align·l_align + l_reg,
                              # TRANS = all three, PERF = w_perf_delta·l_perf + l_reg. l_perf is the variational
                              # cost of the previous outer step (backprop through S only, no GloNet).
                              # Ignored in this mode: w_trans, w_perf, *_lr_multiplier.
-                             # Set output_scale ≈ 5 in this mode: it caps S's step per pixel at
-                             # output_scale·σ_f (0.1 would allow only 1/10 of a reference step f).
+                             # Set output_scale ≈ 5 in this mode: |s| ≤ output_scale, so S can stretch the
+                             # outer step up to (1+output_scale)× per pixel (0.1 would allow only 1.1×).
     delta_inner_k: 20        # Chain length K (memory ~6.3 GiB + ~0.07 GiB per step, gradient checkpointing)
-    w_perf_delta: 2.5        # l_perf weight. l_align is direction-only (1 - cos), so l_perf alone sets the step
-                             # size; check meta/grad_norm_{align,perf}, meta/rho and meta/step_ratio_vs_K_gd
+    w_perf_delta: 2.5        # l_perf weight. l_align = mean(s²) only pulls toward the outer step, so l_perf alone
+                             # decides any stretch; check meta/grad_norm_{align,perf}, meta/rho and meta/step_ratio_vs_f
     mode: "training"  # Options:
                        # - 'training': Train meta-learner from scratch
                        # - 'fine_tune': Load pre-trained and fine-tune
